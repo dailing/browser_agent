@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -6,19 +6,18 @@ from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 
 from browser_agent.audit_logging import JsonlAudit
+from browser_agent.llm_config import resolve_llm_settings
 
 
 class LlmClient:
-    def __init__(self) -> None:
-        key = os.environ.get("OPENAI_API_KEY")
-        if not key:
-            raise RuntimeError("OPENAI_API_KEY is not set")
+    def __init__(self, repo_root: Path | None = None) -> None:
+        key, base, model, temperature = resolve_llm_settings(repo_root)
         kwargs: dict[str, Any] = {"api_key": key}
-        base = os.environ.get("OPENAI_BASE_URL")
         if base:
             kwargs["base_url"] = base
         self._client = AsyncOpenAI(**kwargs)
-        self._model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+        self._model = model
+        self._temperature = temperature
 
     @property
     def model(self) -> str:
@@ -48,7 +47,7 @@ class LlmClient:
                 messages=messages,
                 tools=tools,
                 tool_choice="auto",
-                temperature=0.2,
+                temperature=self._temperature,
             )
         except Exception as e:
             logger.exception("LLM request failed")

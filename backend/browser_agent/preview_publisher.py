@@ -36,11 +36,14 @@ class PreviewPublisher:
                         Path(self._debug_path).write_bytes(data)
                         self._debug_written = True
                     b64 = base64.b64encode(data).decode("ascii")
+                    vs = page.viewport_size
                     payload = json.dumps(
                         {
                             "type": "preview",
                             "mime": "image/jpeg",
                             "data": b64,
+                            "viewport_width": vs["width"],
+                            "viewport_height": vs["height"],
                             "ts": int(time.time() * 1000),
                         }
                     )

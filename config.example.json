@@ -1,0 +1,8 @@
+{
+  "llm": {
+    "api_key": "REPLACE_WITH_YOUR_MINIMAX_OR_OPENAI_KEY",
+    "base_url": "https://api.minimax.io/v1",
+    "model": "MiniMax-M2.7",
+    "temperature": 0.2
+  }
+}

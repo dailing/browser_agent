@@ -11,15 +11,16 @@ from browser_agent.browser_manager import BrowserManager
 from browser_agent.llm_client import LlmClient
 from browser_agent.page_context_builder import PageContextBuilder
 from browser_agent.session_fanout import SessionFanout
-from browser_agent.session_store import SessionStore
+from browser_agent.session_store import DbSessionStore
 from browser_agent.tools_spec import AGENT_TOOLS
 
 SYSTEM_PROMPT = """You control a headless Chromium tab via tools. The user cannot click; only you can.
+The conversation may continue across multiple user messages: answer the latest request using full prior context.
 Rules:
 - After navigate or go_back, call get_observation before clicking or filling.
 - Use refs exactly as shown in observations ([ref=N]). Do not invent refs.
 - Prefer small steps: observe, act, observe again.
-- When the goal is fully satisfied, call done with a concise summary.
+- When the user's request is fully satisfied for this turn, call done with a concise summary.
 - If stuck after retries, call done summarizing what blocked you."""
 
 
@@ -46,12 +47,22 @@ def _tool_result_audit_content(name: str, result: str) -> str | dict[str, Any]:
     return result
 
 
+def _first_user_task_preview(messages: list[dict[str, Any]], limit: int = 500) -> str:
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str) and c.strip():
+            return c[:limit]
+    return ""
+
+
 class RunCoordinator:
     def __init__(
         self,
         repo_root: Path,
         browser: BrowserManager,
-        store: SessionStore,
+        store: DbSessionStore,
         fanout: SessionFanout,
         audit: JsonlAudit,
     ) -> None:
@@ -62,20 +73,22 @@ class RunCoordinator:
         self._audit = audit
 
     async def _append_and_broadcast(self, session_id: str, message: dict[str, Any]) -> None:
-        self._store.append_message(session_id, message)
+        await self._store.append_message(session_id, message)
         self._audit.emit({"type": "conversation_message", "session_id": session_id, "message": message})
         await self._fanout.broadcast(session_id, {"type": "message", "message": message})
 
-    async def run(self, session_id: str, max_steps: int = 40) -> None:
-        session = self._store.get(session_id)
+    async def run(self, session_id: str) -> None:
+        session = await self._store.get(session_id)
         if session is None:
             return
 
+        max_steps = session.max_steps
         self._audit.emit(
             {
                 "type": "run_start",
                 "session_id": session_id,
-                "goal": session.goal,
+                "name": session.name,
+                "task_preview": _first_user_task_preview(session.messages),
                 "max_steps": max_steps,
             }
         )
@@ -90,10 +103,10 @@ class RunCoordinator:
         )
 
         try:
-            llm = LlmClient()
-        except RuntimeError as e:
+            llm = LlmClient(self._repo_root)
+        except (RuntimeError, ValueError) as e:
             logger.error("{}", e)
-            self._store.set_status(session_id, "failed", str(e))
+            await self._store.set_status(session_id, "failed", str(e))
             self._audit.emit({"type": "run_failed", "session_id": session_id, "error": str(e)})
             await self._fanout.broadcast(
                 session_id,
@@ -129,7 +142,7 @@ class RunCoordinator:
                     rec = _assistant_api_dict(msg)
                     messages.append(rec)  # type: ignore[arg-type]
                     await self._append_and_broadcast(session_id, rec)
-                    self._store.set_status(session_id, "completed")
+                    await self._store.set_status(session_id, "idle", None)
                     stop_reason = "assistant_text"
                     break
 
@@ -187,7 +200,7 @@ class RunCoordinator:
                             tool_payload = {"role": "tool", "tool_call_id": tc.id, "content": summary}
                             messages.append(tool_payload)  # type: ignore[arg-type]
                             await self._append_and_broadcast(session_id, tool_payload)
-                            self._store.set_status(session_id, "completed")
+                            await self._store.set_status(session_id, "idle", None)
                             stop_reason = "done_tool"
                             break
 
@@ -210,23 +223,23 @@ class RunCoordinator:
                     continue
 
                 stop_reason = "empty_turn"
-                self._store.set_status(session_id, "failed", "empty_llm_turn")
+                await self._store.set_status(session_id, "failed", "empty_llm_turn")
                 break
 
             if stop_reason is None:
-                self._store.set_status(session_id, "failed", "max_steps_exceeded")
+                await self._store.set_status(session_id, "failed", "max_steps_exceeded")
                 self._audit.emit({"type": "run_max_steps", "session_id": session_id, "max_steps": max_steps})
 
         except Exception as e:
             logger.exception("Run failed")
-            self._store.set_status(session_id, "failed", str(e))
+            await self._store.set_status(session_id, "failed", str(e))
             self._audit.emit({"type": "run_failed", "session_id": session_id, "error": str(e)})
             await self._append_and_broadcast(
                 session_id,
                 {"role": "assistant", "content": f"_Run error: {e}_"},
             )
 
-        final = self._store.get(session_id)
+        final = await self._store.get(session_id)
         st = final.status if final else "unknown"
         self._audit.emit({"type": "run_end", "session_id": session_id, "status": st})
         await self._fanout.broadcast(

@@ -10,6 +10,8 @@ dependencies = [
     "playwright>=1.49.0",
     "loguru>=0.7.0",
     "openai>=1.55.0",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "aiosqlite>=0.20.0",
 ]
 
 [project.scripts]

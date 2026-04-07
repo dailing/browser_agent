@@ -6,7 +6,8 @@ Headless browser agent with live JPEG preview (`plain.md`): Playwright, FastAPI,
 
 - [uv](https://docs.astral.sh/uv/)
 - Node.js 20+ (for the frontend)
-- `OPENAI_API_KEY` (agent). Optional: `OPENAI_BASE_URL`, `OPENAI_MODEL` (default `gpt-4o-mini`).
+- **LLM config**: copy `config.example.json` to **`config.json`** at the repo root (this file is gitignored) and set `llm.api_key`, `llm.base_url`, `llm.model`, `llm.temperature`. Defaults suit **MiniMax** OpenAI-compatible API (`https://api.minimax.io/v1`, e.g. `MiniMax-M2.7`). Override path with `BROWSER_AGENT_CONFIG` if needed.
+- **Or** set env only: `OPENAI_API_KEY`, optional `OPENAI_BASE_URL`, `OPENAI_MODEL`, `OPENAI_TEMPERATURE` (env wins over `config.json` for those fields).
 
 ## Backend (`backend/`, uv)
 
@@ -23,7 +24,9 @@ Environment: `BROWSER_AGENT_START_URL`, `BROWSER_AGENT_HOST`, `BROWSER_AGENT_POR
 
 Each server process writes **loguru** text logs and a **JSON Lines** audit file under `log/run_<utc>_<pid>.jsonl` and `log/run_<utc>_<pid>.log` (LLM requests/responses, tool calls/results, conversation messages).
 
-API: `POST /api/runs` `{ "goal", "max_steps" }`, `GET /api/sessions`, `GET /api/sessions/{id}`, WebSocket ` /ws/session/{id}` for live session updates.
+Sessions are persisted in **SQLite** (default path `data/browser_agent.sqlite3` under the repo root, override with `BROWSER_AGENT_DB`). ORM: **SQLAlchemy 2 async** + `aiosqlite` (no hand-written SQL in app code).
+
+API (chat flow): `POST /api/sessions` `{ "name?`, "max_steps" }` creates an empty session (`idle`). `POST /api/sessions/{id}/messages` `{ "text" }` appends a user message and runs the agent (returns `409` if already `running`). `GET /api/sessions`, `GET /api/sessions/{id}`, WebSocket `/ws/session/{id}` for live updates. Session status: `idle` | `running` | `failed`.
 
 ## Frontend (`frontend/`)
 
