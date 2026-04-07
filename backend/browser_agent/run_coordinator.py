@@ -9,7 +9,7 @@ from browser_agent.action_executor import ActionExecutor
 from browser_agent.audit_logging import JsonlAudit
 from browser_agent.browser_manager import BrowserManager
 from browser_agent.llm_client import LlmClient
-from browser_agent.page_context_builder import PageContextBuilder
+from browser_agent.actions.registry import TOOLS_REQUIRING_BROWSER
 from browser_agent.session_fanout import SessionFanout
 from browser_agent.session_store import DbSessionStore
 from browser_agent.tools_spec import AGENT_TOOLS
@@ -20,6 +20,7 @@ Rules:
 - After navigate or go_back, call get_observation before clicking or filling.
 - Use refs exactly as shown in observations ([ref=N]). Do not invent refs.
 - Prefer small steps: observe, act, observe again.
+- To turn a page into markdown text: export_page_pdf (saves under log/pdf), then convert_pdf_to_markdown with that pdf_path (relative to project root). The tool returns markdown and a download URL from the PDF Reader API.
 - When the user's request is fully satisfied for this turn, call done with a concise summary.
 - If stuck after retries, call done summarizing what blocked you."""
 
@@ -44,6 +45,8 @@ def _assistant_api_dict(msg) -> dict[str, Any]:
 def _tool_result_audit_content(name: str, result: str) -> str | dict[str, Any]:
     if name == "get_observation" and len(result) > 6000:
         return {"truncated": True, "head": result[:6000], "total_len": len(result)}
+    if name == "convert_pdf_to_markdown" and len(result) > 8000:
+        return {"truncated": True, "head": result[:8000], "total_len": len(result)}
     return result
 
 
@@ -92,6 +95,7 @@ class RunCoordinator:
                 "max_steps": max_steps,
             }
         )
+        has_tab = self._browser.has_live_tab(session_id)
         await self._fanout.broadcast(
             session_id,
             {
@@ -99,6 +103,7 @@ class RunCoordinator:
                 "session_id": session_id,
                 "status": session.status,
                 "messages": list(session.messages),
+                "has_live_tab": has_tab,
             },
         )
 
@@ -114,9 +119,8 @@ class RunCoordinator:
             )
             return
 
-        page = self._browser.page
-        builder = PageContextBuilder(page)
-        executor = ActionExecutor(page, self._repo_root, builder)
+        self._browser.touch_tab_activity_if_exists(session_id)
+        executor = ActionExecutor(self._browser, self._repo_root)
 
         messages: list[ChatCompletionMessageParam] = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -186,25 +190,9 @@ class RunCoordinator:
                             }
                         )
 
-                        if name == "done":
-                            summary = str(args.get("summary", ""))
-                            self._audit.emit(
-                                {
-                                    "type": "tool_result",
-                                    "session_id": session_id,
-                                    "turn": turn,
-                                    "name": name,
-                                    "content": summary,
-                                }
-                            )
-                            tool_payload = {"role": "tool", "tool_call_id": tc.id, "content": summary}
-                            messages.append(tool_payload)  # type: ignore[arg-type]
-                            await self._append_and_broadcast(session_id, tool_payload)
-                            await self._store.set_status(session_id, "idle", None)
-                            stop_reason = "done_tool"
-                            break
-
                         result = await executor.execute(session_id, name, args)
+                        if name in TOOLS_REQUIRING_BROWSER:
+                            self._browser.touch_tab_activity_if_exists(session_id)
                         self._audit.emit(
                             {
                                 "type": "tool_result",
@@ -217,6 +205,11 @@ class RunCoordinator:
                         tool_payload = {"role": "tool", "tool_call_id": tc.id, "content": result}
                         messages.append(tool_payload)  # type: ignore[arg-type]
                         await self._append_and_broadcast(session_id, tool_payload)
+
+                        if name == "done":
+                            await self._store.set_status(session_id, "idle", None)
+                            stop_reason = "done_tool"
+                            break
 
                     if stop_reason == "done_tool":
                         break

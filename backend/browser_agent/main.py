@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.websockets import WebSocket as StarletteWebSocket
 from sqlalchemy.ext.asyncio import AsyncEngine
 from uvicorn import run as uvicorn_run
 
@@ -26,9 +27,23 @@ START_URL = os.environ.get("BROWSER_AGENT_START_URL", "https://example.com")
 HOST = os.environ.get("BROWSER_AGENT_HOST", "127.0.0.1")
 PORT = int(os.environ.get("BROWSER_AGENT_PORT", "18000"))
 PREVIEW_MS = int(os.environ.get("BROWSER_AGENT_PREVIEW_MS", "500"))
+SESSION_TAB_IDLE_SEC = float(os.environ.get("BROWSER_AGENT_SESSION_TAB_IDLE_SEC", "21600"))
+
+os.environ.setdefault("PDF_READER_API_BASE", "http://server.tail13fe1.ts.net:10000")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _STATIC_DIR = _REPO_ROOT / "frontend" / "dist"
+
+
+class HttpOnlyStaticFiles(StaticFiles):
+    """StaticFiles mounted at `/` must not receive WebSocket scopes (e.g. `/ws/preview` without id)."""
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "websocket":
+            ws = StarletteWebSocket(scope, receive=receive, send=send)
+            await ws.close(code=1008, reason="Not a WebSocket endpoint")
+            return
+        await super().__call__(scope, receive, send)
 
 _publisher: PreviewPublisher | None = None
 _browser: BrowserManager | None = None
@@ -53,7 +68,7 @@ def _op_lock(session_id: str) -> asyncio.Lock:
 _PW_MOUSE_BUTTON = {0: "left", 1: "middle", 2: "right"}
 
 
-async def _apply_remote_mouse_json(raw: str) -> None:
+async def _apply_remote_mouse_json(session_id: str, raw: str) -> None:
     if _browser is None:
         return
     try:
@@ -75,7 +90,9 @@ async def _apply_remote_mouse_json(raw: str) -> None:
     except (TypeError, ValueError):
         btn = 0
     pw_btn = _PW_MOUSE_BUTTON.get(btn, "left")
-    page = _browser.page
+    page = _browser.get_page_if_exists(session_id)
+    if page is None:
+        return
     try:
         if ev == "move":
             await page.mouse.move(x, y)
@@ -117,11 +134,22 @@ async def lifespan(app: FastAPI):
     _viewport_presets = list(presets)
     _preset_by_id = {str(p["id"]): p for p in _viewport_presets}
     initial_vp = initial_viewport_from_presets(_viewport_presets, default_vp_id)
-    _browser = BrowserManager(START_URL, viewport=initial_vp)
+    _browser = BrowserManager(
+        START_URL, viewport=initial_vp, tab_idle_timeout_sec=SESSION_TAB_IDLE_SEC
+    )
     await _browser.start()
+
+    async def _broadcast_live_tab(sid: str, has_tab: bool) -> None:
+        if _fanout is not None:
+            await _fanout.broadcast(
+                sid,
+                {"type": "live_tab", "session_id": sid, "has_live_tab": has_tab},
+            )
+
+    _browser.set_on_live_tab(_broadcast_live_tab)
     _coordinator = RunCoordinator(_REPO_ROOT, _browser, _session_store, _fanout, _audit)
-    _publisher = PreviewPublisher(interval_ms=PREVIEW_MS)
-    _publisher.start(_browser.page)
+    _publisher = PreviewPublisher(interval_ms=PREVIEW_MS, browser=_browser)
+    _publisher.start()
     yield
     if _publisher is not None:
         await _publisher.stop()
@@ -167,6 +195,8 @@ async def push_user_message(session_id: str, body: PushMessageBody):
         await _session_store.set_status(session_id, "running", None)
         _audit.emit({"type": "conversation_message", "session_id": session_id, "message": user_msg})
         await _fanout.broadcast(session_id, {"type": "message", "message": user_msg})
+    if _browser is not None:
+        _browser.touch_tab_activity_if_exists(session_id)
     asyncio.create_task(_coordinator.run(session_id))
     return {"ok": True, "status": "running"}
 
@@ -175,17 +205,20 @@ async def push_user_message(session_id: str, body: PushMessageBody):
 async def list_sessions():
     if _session_store is None:
         raise HTTPException(status_code=503, detail="server not ready")
-    return await _session_store.list_summaries()
+    rows = await _session_store.list_summaries()
+    for r in rows:
+        r["has_live_tab"] = _browser.has_live_tab(r["id"]) if _browser is not None else False
+    return rows
 
 
 @app.get("/api/browser/viewport")
 async def get_browser_viewport():
     if _browser is None:
         raise HTTPException(status_code=503, detail="server not ready")
-    vs = _browser.page.viewport_size
+    iv = _browser.initial_viewport
     return {
         "presets": list(_viewport_presets),
-        "current": {"width": vs["width"], "height": vs["height"]},
+        "current": {"width": iv["width"], "height": iv["height"]},
     }
 
 
@@ -211,6 +244,7 @@ async def get_session(session_id: str):
     s = await _session_store.get(session_id)
     if s is None:
         raise HTTPException(status_code=404, detail="not found")
+    has_tab = _browser.has_live_tab(session_id) if _browser is not None else False
     return {
         "id": s.id,
         "name": s.name,
@@ -220,6 +254,7 @@ async def get_session(session_id: str):
         "max_steps": s.max_steps,
         "error": s.error,
         "messages": s.messages,
+        "has_live_tab": has_tab,
     }
 
 
@@ -235,12 +270,14 @@ async def ws_session(websocket: WebSocket, session_id: str):
     await websocket.accept()
     await _fanout.subscribe(session_id, websocket)
     try:
+        has_tab = _browser.has_live_tab(session_id) if _browser is not None else False
         await websocket.send_json(
             {
                 "type": "snapshot",
                 "session_id": session_id,
                 "status": s.status,
                 "messages": list(s.messages),
+                "has_live_tab": has_tab,
             }
         )
         while True:
@@ -256,11 +293,18 @@ async def ws_session(websocket: WebSocket, session_id: str):
         await _fanout.unsubscribe(session_id, websocket)
 
 
-@app.websocket("/ws/preview")
-async def ws_preview(websocket: WebSocket):
+@app.websocket("/ws/preview/{session_id}")
+async def ws_preview(websocket: WebSocket, session_id: str):
+    if _session_store is None:
+        await websocket.close(code=1011)
+        return
+    s = await _session_store.get(session_id)
+    if s is None:
+        await websocket.close(code=1008, reason="session not found")
+        return
     await websocket.accept()
     if _publisher is not None:
-        await _publisher.add_client(websocket)
+        await _publisher.add_client(session_id, websocket)
     try:
         while True:
             msg = await websocket.receive()
@@ -269,18 +313,27 @@ async def ws_preview(websocket: WebSocket):
             if msg.get("type") == "websocket.receive":
                 text = msg.get("text")
                 if text:
-                    await _apply_remote_mouse_json(text)
+                    await _apply_remote_mouse_json(session_id, text)
     except WebSocketDisconnect:
         pass
     finally:
         if _publisher is not None:
-            await _publisher.remove_client(websocket)
+            await _publisher.remove_client(session_id, websocket)
+
+
+@app.websocket("/ws/preview")
+async def ws_preview_legacy(websocket: WebSocket):
+    await websocket.accept()
+    await websocket.close(
+        code=1008,
+        reason="Use ws/preview/{session_id} (per-session preview)",
+    )
 
 
 if _STATIC_DIR.is_dir():
     app.mount(
         "/",
-        StaticFiles(directory=str(_STATIC_DIR), html=True),
+        HttpOnlyStaticFiles(directory=str(_STATIC_DIR), html=True),
         name="static",
     )
 

@@ -43,14 +43,12 @@ _MAX_CHARS = 48_000
 
 
 class PageContextBuilder:
-    def __init__(self, page: Page) -> None:
-        self._page = page
-
-    async def build(self) -> str:
-        data: dict[str, Any] = await self._page.evaluate(_BUILD_JS)
+    @staticmethod
+    async def build(page: Page) -> str:
+        data: dict[str, Any] = await page.evaluate(_BUILD_JS)
         lines: list[str] = data.get("lines") or []
-        title = await self._page.title()
-        url = self._page.url
+        title = await page.title()
+        url = page.url
         body = "\n".join(lines)
         outline = f"URL: {url}\nTitle: {title}\nInteractive elements ({data.get('count', 0)}):\n{body}"
         if len(outline) > _MAX_CHARS:
