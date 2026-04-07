@@ -23,6 +23,17 @@ class SessionFanout:
             if not subs:
                 del self._subs[session_id]
 
+    async def drop_session(self, session_id: str) -> None:
+        async with self._lock:
+            subs = self._subs.pop(session_id, None)
+            ws_list = list(subs) if subs else []
+        for ws in ws_list:
+            try:
+                if ws.client_state == WebSocketState.CONNECTED:
+                    await ws.close(code=1008, reason="session deleted")
+            except Exception:
+                pass
+
     async def broadcast(self, session_id: str, payload: dict[str, Any]) -> None:
         async with self._lock:
             subs = list(self._subs.get(session_id, ()))

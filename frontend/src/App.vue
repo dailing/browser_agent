@@ -9,6 +9,7 @@ const loadingSessions = ref(false)
 const newSessionName = ref('')
 const newMaxSteps = ref(40)
 const creatingSession = ref(false)
+const deletingSessionId = ref(null)
 
 const sessionId = ref(null)
 const messages = ref([])
@@ -20,6 +21,7 @@ const sendError = ref('')
 const logEl = ref(null)
 const imgSrc = ref('')
 const previewPlaceholder = ref(false)
+const previewTabReady = ref(false)
 const previewStatus = ref('connecting')
 const viewportWidth = ref(0)
 const viewportHeight = ref(0)
@@ -28,15 +30,12 @@ const viewportPresets = ref([])
 const viewportPresetId = ref('')
 const viewportApplyBusy = ref(false)
 const VIEWPORT_LS_KEY = 'browser_agent_viewport_preset'
-const VIEW_MODE_LS_KEY = 'browser_agent_right_view_mode'
 const SPLIT_PCT_LS_KEY = 'browser_agent_split_pct'
 
-function normalizeViewMode(v) {
-  if (v === 'chat' || v === 'both' || v === 'preview') return v
-  return 'both'
-}
-
-const viewMode = ref(normalizeViewMode(typeof localStorage !== 'undefined' ? localStorage.getItem(VIEW_MODE_LS_KEY) : null))
+const MIN_CHAT_W = 220
+const MIN_PREVIEW_W = 200
+const SPLIT_COLLAPSE_PX = 96
+const GUTTER_W = 8
 
 function readInitialSplitPct() {
   const n = Number(typeof localStorage !== 'undefined' ? localStorage.getItem(SPLIT_PCT_LS_KEY) : NaN)
@@ -45,16 +44,13 @@ function readInitialSplitPct() {
 }
 const splitPct = ref(readInitialSplitPct())
 const workspaceBodyEl = ref(null)
+const chatPanelEl = ref(null)
+const previewPanelEl = ref(null)
 
-function setViewMode(mode) {
-  const m = normalizeViewMode(mode)
-  viewMode.value = m
-  try {
-    localStorage.setItem(VIEW_MODE_LS_KEY, m)
-  } catch {
-    /* ignore */
-  }
-}
+const chatCollapsed = ref(false)
+const previewCollapsed = ref(false)
+
+let workspaceResizeObserver = null
 
 function persistSplitPct() {
   try {
@@ -64,10 +60,18 @@ function persistSplitPct() {
   }
 }
 
+function clampSplitPctForWidth(pct, totalW) {
+  const W = totalW || 1
+  const lo = (MIN_CHAT_W / W) * 100
+  const hi = ((W - MIN_PREVIEW_W - GUTTER_W) / W) * 100
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi < lo) return pct
+  return Math.max(lo, Math.min(hi, pct))
+}
+
 function onSplitMouseDown(ev) {
   ev.preventDefault()
   const container = workspaceBodyEl.value
-  if (!container) return
+  if (!container || chatCollapsed.value || previewCollapsed.value) return
   const rect = container.getBoundingClientRect()
   const total = rect.width || 1
   const startX = ev.clientX
@@ -76,30 +80,145 @@ function onSplitMouseDown(ev) {
   function onMove(e) {
     const dx = e.clientX - startX
     const next = startPct + (dx / total) * 100
-    splitPct.value = Math.max(22, Math.min(78, next))
+    splitPct.value = Math.max(0.5, Math.min(99.5, next))
   }
   function onUp() {
     window.removeEventListener('mousemove', onMove)
     window.removeEventListener('mouseup', onUp)
+    const w = container.getBoundingClientRect().width
+    const cw = chatPanelEl.value?.getBoundingClientRect().width ?? 0
+    const pw = previewPanelEl.value?.getBoundingClientRect().width ?? 0
+    if (cw < SPLIT_COLLAPSE_PX) {
+      chatCollapsed.value = true
+    } else if (pw < SPLIT_COLLAPSE_PX) {
+      previewCollapsed.value = true
+    } else {
+      splitPct.value = clampSplitPctForWidth(splitPct.value, w)
+    }
     persistSplitPct()
   }
   window.addEventListener('mousemove', onMove)
   window.addEventListener('mouseup', onUp)
 }
 
+const bothPanelsOpen = computed(() => !chatCollapsed.value && !previewCollapsed.value)
+
 const chatPanelStyle = computed(() => {
-  if (viewMode.value === 'both') {
-    return { flex: `0 0 ${splitPct.value}%`, minWidth: '220px' }
+  if (bothPanelsOpen.value) {
+    return { flex: `0 0 ${splitPct.value}%`, minWidth: 0 }
   }
+  if (!chatCollapsed.value) return { flex: '1 1 0%', minWidth: `${MIN_CHAT_W}px` }
   return {}
 })
 
 const previewPanelStyle = computed(() => {
-  if (viewMode.value === 'both') {
-    return { flex: '1 1 0%', minWidth: '200px' }
+  if (bothPanelsOpen.value) {
+    return { flex: '1 1 0%', minWidth: 0 }
   }
+  if (!previewCollapsed.value) return { flex: '1 1 0%', minWidth: `${MIN_PREVIEW_W}px` }
   return {}
 })
+
+function expandPreview() {
+  const el = workspaceBodyEl.value
+  const W = el?.getBoundingClientRect().width ?? 0
+  const needBoth = MIN_CHAT_W + MIN_PREVIEW_W + GUTTER_W
+  if (W > 0 && W < needBoth) {
+    chatCollapsed.value = true
+  } else if (W >= needBoth) {
+    chatCollapsed.value = false
+  }
+  previewCollapsed.value = false
+  nextTick(() => {
+    const root = workspaceBodyEl.value
+    if (!root) return
+    const w = root.getBoundingClientRect().width
+    if (w <= 0) return
+    splitPct.value = clampSplitPctForWidth(splitPct.value, w)
+    syncPanelsToWorkspaceSize()
+  })
+}
+
+function expandChat() {
+  const el = workspaceBodyEl.value
+  const W = el?.getBoundingClientRect().width ?? 0
+  const needBoth = MIN_CHAT_W + MIN_PREVIEW_W + GUTTER_W
+  if (W > 0 && W < needBoth) {
+    previewCollapsed.value = true
+  } else if (W >= needBoth) {
+    previewCollapsed.value = false
+  }
+  chatCollapsed.value = false
+  nextTick(() => {
+    const root = workspaceBodyEl.value
+    if (!root) return
+    const w = root.getBoundingClientRect().width
+    if (w <= 0) return
+    splitPct.value = clampSplitPctForWidth(splitPct.value, w)
+    syncPanelsToWorkspaceSize()
+  })
+}
+
+function syncPanelsToWorkspaceSize() {
+  const el = workspaceBodyEl.value
+  if (!el) return
+  const W = el.getBoundingClientRect().width
+  if (W <= 0) return
+
+  const needBoth = MIN_CHAT_W + MIN_PREVIEW_W + GUTTER_W
+  const peek = 14
+
+  if (chatCollapsed.value && previewCollapsed.value) {
+    if (W >= needBoth) {
+      chatCollapsed.value = false
+      previewCollapsed.value = false
+      splitPct.value = clampSplitPctForWidth(splitPct.value, W)
+    } else if (W >= MIN_CHAT_W + peek) {
+      chatCollapsed.value = false
+    } else if (W >= MIN_PREVIEW_W + peek) {
+      previewCollapsed.value = false
+    }
+    return
+  }
+
+  if (!chatCollapsed.value && previewCollapsed.value && W >= needBoth) {
+    previewCollapsed.value = false
+    splitPct.value = clampSplitPctForWidth(splitPct.value, W)
+    return
+  }
+  if (chatCollapsed.value && !previewCollapsed.value && W >= needBoth) {
+    chatCollapsed.value = false
+    splitPct.value = clampSplitPctForWidth(splitPct.value, W)
+    return
+  }
+
+  if (!chatCollapsed.value && !previewCollapsed.value) {
+    const cw = chatPanelEl.value?.getBoundingClientRect().width ?? 0
+    const pw = previewPanelEl.value?.getBoundingClientRect().width ?? 0
+    if (W < needBoth) {
+      previewCollapsed.value = true
+      return
+    }
+    if (pw < MIN_PREVIEW_W - 0.5) {
+      previewCollapsed.value = true
+      return
+    }
+    if (cw < MIN_CHAT_W - 0.5) {
+      chatCollapsed.value = true
+      return
+    }
+    splitPct.value = clampSplitPctForWidth(splitPct.value, W)
+    return
+  }
+
+  if (!chatCollapsed.value && previewCollapsed.value && W < MIN_CHAT_W + peek) {
+    chatCollapsed.value = true
+    return
+  }
+  if (!previewCollapsed.value && chatCollapsed.value && W < MIN_PREVIEW_W + peek) {
+    previewCollapsed.value = true
+  }
+}
 
 let previewWs = null
 let previewReconnectTimer = null
@@ -112,39 +231,84 @@ function connectPreview(id) {
     clearTimeout(previewReconnectTimer)
     previewReconnectTimer = null
   }
-  if (previewWs) {
-    previewWs.close()
-    previewWs = null
+
+  const sid = id || null
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const pathSuffix = `/ws/preview/${sid}`
+
+  if (
+    sid &&
+    previewWs &&
+    (previewWs.readyState === WebSocket.OPEN || previewWs.readyState === WebSocket.CONNECTING)
+  ) {
+    try {
+      const p = new URL(previewWs.url).pathname
+      if (p === pathSuffix || p.endsWith(pathSuffix)) return
+    } catch {
+      /* ignore */
+    }
   }
-  if (!id) {
+
+  if (!sid) {
+    if (previewWs) {
+      previewWs.close()
+      previewWs = null
+    }
     previewStatus.value = 'no_session'
     imgSrc.value = ''
     previewPlaceholder.value = false
+    previewTabReady.value = false
     viewportWidth.value = 0
     viewportHeight.value = 0
     return
   }
+
+  if (previewWs) {
+    previewWs.close()
+    previewWs = null
+  }
+
   imgSrc.value = ''
   previewPlaceholder.value = false
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const url = `${proto}//${location.host}/ws/preview/${id}`
-  previewWs = new WebSocket(url)
-  previewWs.onopen = () => {
+  previewTabReady.value = false
+  const url = `${proto}//${location.host}${pathSuffix}`
+  const ws = new WebSocket(url)
+  previewWs = ws
+
+  ws.onopen = () => {
+    if (previewWs !== ws) return
     previewStatus.value = 'live'
   }
-  previewWs.onmessage = (ev) => {
+
+  ws.onmessage = (ev) => {
+    if (previewWs !== ws) return
     try {
       const msg = JSON.parse(ev.data)
       if (msg.type !== 'preview') return
+      if (msg.state === 'waiting') {
+        imgSrc.value = ''
+        previewPlaceholder.value = true
+        previewTabReady.value = false
+        viewportWidth.value = 0
+        viewportHeight.value = 0
+        return
+      }
+      if (msg.state === 'tab_opened') {
+        previewPlaceholder.value = false
+        previewTabReady.value = true
+        return
+      }
       if (msg.state === 'placeholder') {
         imgSrc.value = ''
         previewPlaceholder.value = true
+        previewTabReady.value = false
         viewportWidth.value = 0
         viewportHeight.value = 0
         return
       }
       if (msg.state === 'live' && msg.mime === 'image/jpeg' && msg.data) {
         previewPlaceholder.value = false
+        previewTabReady.value = false
         if (typeof msg.viewport_width === 'number' && typeof msg.viewport_height === 'number') {
           viewportWidth.value = msg.viewport_width
           viewportHeight.value = msg.viewport_height
@@ -155,13 +319,20 @@ function connectPreview(id) {
       /* ignore */
     }
   }
-  previewWs.onerror = () => {
+
+  ws.onerror = () => {
+    if (previewWs !== ws) return
     previewStatus.value = 'error'
   }
-  previewWs.onclose = () => {
-    if (!sessionId.value) return
+
+  ws.onclose = () => {
+    if (previewWs !== ws) return
+    if (!sessionId.value || sessionId.value !== sid) return
     previewStatus.value = 'reconnecting'
-    previewReconnectTimer = setTimeout(() => connectPreview(sessionId.value), 1500)
+    previewReconnectTimer = setTimeout(() => {
+      previewReconnectTimer = null
+      if (sessionId.value === sid) connectPreview(sid)
+    }, 1500)
   }
 }
 
@@ -237,7 +408,6 @@ async function createSession() {
     messages.value = []
     runStatus.value = j.status || 'idle'
     connectSessionWs(j.session_id)
-    connectPreview(j.session_id)
     await loadSessions()
   } catch (e) {
     sendError.value = e.message || String(e)
@@ -268,7 +438,31 @@ async function openSession(id) {
     sendError.value = e.message || String(e)
   }
   connectSessionWs(id)
-  connectPreview(id)
+}
+
+async function deleteSession(id) {
+  if (deletingSessionId.value) return
+  deletingSessionId.value = id
+  sendError.value = ''
+  try {
+    const r = await fetch(`/api/sessions/${id}`, { method: 'DELETE' })
+    if (r.status === 409) {
+      sendError.value = 'Wait for the agent to finish before deleting this session.'
+      return
+    }
+    if (!r.ok) throw new Error((await r.text()) || r.statusText)
+    if (sessionId.value === id) {
+      disconnectSessionWs()
+      sessionId.value = null
+      messages.value = []
+      runStatus.value = ''
+    }
+    await loadSessions()
+  } catch (e) {
+    sendError.value = e.message || String(e)
+  } finally {
+    deletingSessionId.value = null
+  }
 }
 
 const agentBusy = computed(() => runStatus.value === 'running')
@@ -324,9 +518,13 @@ async function scrollLog() {
 
 watch(messages, scrollLog, { deep: true })
 
-watch(sessionId, (id) => {
-  connectPreview(id || null)
-})
+watch(
+  sessionId,
+  (id) => {
+    connectPreview(id || null)
+  },
+  { flush: 'sync' },
+)
 
 function sendRemoteMouse(event, x, y, button = 0) {
   if (!previewWs || previewWs.readyState !== WebSocket.OPEN) return
@@ -444,8 +642,26 @@ onMounted(() => {
   connectPreview()
   loadSessions()
   loadViewportOptions()
+  nextTick(() => {
+    const root = workspaceBodyEl.value
+    if (!root) {
+      syncPanelsToWorkspaceSize()
+      return
+    }
+    if (typeof ResizeObserver !== 'undefined') {
+      workspaceResizeObserver = new ResizeObserver(() => {
+        syncPanelsToWorkspaceSize()
+      })
+      workspaceResizeObserver.observe(root)
+    }
+    syncPanelsToWorkspaceSize()
+  })
 })
 onUnmounted(() => {
+  if (workspaceResizeObserver) {
+    workspaceResizeObserver.disconnect()
+    workspaceResizeObserver = null
+  }
   if (previewMoveRaf != null) cancelAnimationFrame(previewMoveRaf)
   if (previewReconnectTimer) clearTimeout(previewReconnectTimer)
   if (previewWs) previewWs.close()
@@ -454,9 +670,9 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="container-fluid py-3">
-    <div class="row g-3 flex-nowrap main-row">
-      <div class="col-auto border-end pe-2" style="width: 220px; min-width: 200px">
+  <div class="app-shell">
+    <div class="row g-2 flex-nowrap main-row">
+      <div class="col-auto border-end pe-2 sidebar-col d-flex flex-column" style="width: 220px; min-width: 200px">
         <div class="small text-muted mb-2 fw-semibold">Sessions</div>
         <div class="mb-2">
           <input
@@ -489,79 +705,75 @@ onUnmounted(() => {
         </div>
         <div v-if="loadingSessions" class="small text-muted">Loading...</div>
         <div v-else class="list-group list-group-flush small session-list">
-          <button
+          <div
             v-for="s in sessions"
             :key="s.id"
-            type="button"
-            class="list-group-item list-group-item-action py-2 px-2"
+            class="list-group-item session-row py-2 px-2"
             :class="{ active: sessionId === s.id }"
-            @click="openSession(s.id)"
           >
-            <div class="d-flex align-items-center gap-2">
-              <span
-                class="session-live-dot flex-shrink-0"
-                :class="{ on: s.has_live_tab }"
-                :title="s.has_live_tab ? 'Live browser tab' : 'No live tab (opens on first browser action)'"
-              />
-              <div class="text-truncate flex-grow-1">{{ s.name || s.id.slice(0, 8) }}</div>
+            <div class="d-flex align-items-start gap-1">
+              <button
+                type="button"
+                class="session-select text-start btn btn-link text-decoration-none text-body p-0 border-0 flex-grow-1 min-w-0"
+                :class="{ 'text-white': sessionId === s.id }"
+                @click="openSession(s.id)"
+              >
+                <div class="d-flex align-items-center gap-2">
+                  <span
+                    class="session-live-dot flex-shrink-0"
+                    :class="{ on: s.has_live_tab }"
+                    :title="s.has_live_tab ? 'Live browser tab' : 'No live tab (opens on first browser action)'"
+                  />
+                  <div class="text-truncate">{{ s.name || s.id.slice(0, 8) }}</div>
+                </div>
+                <div class="text-muted session-meta" :class="{ 'text-white-50': sessionId === s.id }">
+                  {{ s.status }} · {{ s.message_count }} msg
+                </div>
+              </button>
+              <button
+                type="button"
+                class="btn btn-sm session-delete p-0 flex-shrink-0 text-danger border-0 bg-transparent lh-1"
+                title="Delete session"
+                :disabled="deletingSessionId === s.id"
+                @click.stop="deleteSession(s.id)"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                  <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z" />
+                  <path
+                    d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"
+                  />
+                </svg>
+              </button>
             </div>
-            <div class="text-muted" style="font-size: 0.7rem">{{ s.status }} · {{ s.message_count }} msg</div>
-          </button>
+          </div>
         </div>
       </div>
 
       <div class="col d-flex flex-column workspace-root" style="min-width: 0">
-        <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
-          <div class="btn-group btn-group-sm" role="group" aria-label="Workspace layout">
-            <button
-              type="button"
-              class="btn btn-outline-secondary"
-              :class="{ active: viewMode === 'chat' }"
-              @click="setViewMode('chat')"
-            >
-              Chat
-            </button>
-            <button
-              type="button"
-              class="btn btn-outline-secondary"
-              :class="{ active: viewMode === 'both' }"
-              @click="setViewMode('both')"
-            >
-              Both
-            </button>
-            <button
-              type="button"
-              class="btn btn-outline-secondary"
-              :class="{ active: viewMode === 'preview' }"
-              @click="setViewMode('preview')"
-            >
-              Preview
-            </button>
-          </div>
+        <div class="d-flex align-items-center justify-content-end mb-1 flex-wrap gap-2 flex-shrink-0">
           <span v-if="runStatus" class="badge text-bg-secondary text-capitalize">{{ runStatus }}</span>
         </div>
 
         <div
           ref="workspaceBodyEl"
           class="workspace-body d-flex flex-row flex-grow-1 align-items-stretch"
-          :class="{ 'is-split': viewMode === 'both' }"
+          :class="{ 'is-split': bothPanelsOpen }"
         >
           <div
-            v-show="viewMode !== 'preview'"
-            class="d-flex flex-column panel-chat"
-            :class="{ 'flex-grow-1': viewMode === 'chat' }"
+            v-show="!chatCollapsed"
+            ref="chatPanelEl"
+            class="d-flex flex-column panel-chat min-h-0"
             :style="chatPanelStyle"
           >
-            <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
+            <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2 flex-shrink-0">
               <h1 class="h5 mb-0">Chat</h1>
             </div>
-            <p v-if="sessionId" class="small text-muted mb-2 font-monospace text-truncate">session: {{ sessionId }}</p>
-            <p v-else class="small text-muted">Create a chat or pick one from the list.</p>
-            <div v-if="sendError" class="alert alert-warning py-1 px-2 small mb-2">{{ sendError }}</div>
+            <p v-if="sessionId" class="small text-muted mb-2 font-monospace text-truncate flex-shrink-0">session: {{ sessionId }}</p>
+            <p v-else class="small text-muted flex-shrink-0">Create a chat or pick one from the list.</p>
+            <div v-if="sendError" class="alert alert-warning py-1 px-2 small mb-2 flex-shrink-0">{{ sendError }}</div>
             <div
               ref="logEl"
-              class="border rounded flex-grow-1 overflow-auto bg-body-secondary p-2 mb-2 chat-log"
-              style="min-height: 200px"
+              class="border rounded flex-grow-1 overflow-auto bg-body-secondary p-2 mb-2 chat-log min-h-0"
             >
               <div v-if="!messages.length" class="text-secondary small">No messages yet. Type below and send.</div>
               <div
@@ -588,7 +800,7 @@ onUnmounted(() => {
                 </template>
               </div>
             </div>
-            <div class="border rounded p-2 bg-body-tertiary mt-auto">
+            <div class="border rounded p-2 bg-body-tertiary flex-shrink-0">
               <label class="form-label small text-muted mb-1">Message</label>
               <textarea
                 v-model="draft"
@@ -608,39 +820,58 @@ onUnmounted(() => {
           </div>
 
           <div
-            v-show="viewMode === 'both'"
+            v-show="bothPanelsOpen"
             class="split-gutter flex-shrink-0"
             title="Drag to resize chat and preview"
             @mousedown.prevent="onSplitMouseDown"
           />
 
           <button
-            v-if="viewMode === 'chat'"
+            v-if="previewCollapsed && !chatCollapsed"
             type="button"
             class="peek-btn peek-edge-right flex-shrink-0"
             title="Show browser preview"
-            @click="setViewMode('both')"
+            @click="expandPreview"
           >
             Preview
           </button>
 
           <button
-            v-if="viewMode === 'preview'"
+            v-if="chatCollapsed && !previewCollapsed"
             type="button"
             class="peek-btn peek-edge-left flex-shrink-0"
             title="Show chat"
-            @click="setViewMode('both')"
+            @click="expandChat"
           >
             Chat
           </button>
 
+          <div v-if="chatCollapsed && previewCollapsed" class="d-flex flex-row flex-shrink-0 align-items-stretch">
+            <button
+              type="button"
+              class="peek-btn peek-edge-right flex-shrink-0"
+              title="Show chat"
+              @click="expandChat"
+            >
+              Chat
+            </button>
+            <button
+              type="button"
+              class="peek-btn peek-edge-left flex-shrink-0 border-start-0"
+              title="Show browser preview"
+              @click="expandPreview"
+            >
+              Preview
+            </button>
+          </div>
+
           <div
-            v-show="viewMode !== 'chat'"
-            class="d-flex flex-column panel-preview preview-col"
-            :class="{ 'flex-grow-1': viewMode === 'preview' }"
+            v-show="!previewCollapsed"
+            ref="previewPanelEl"
+            class="d-flex flex-column panel-preview preview-col min-h-0"
             :style="previewPanelStyle"
           >
-            <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
+            <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2 flex-shrink-0">
               <h2 class="h5 mb-0">Browser preview</h2>
               <div class="d-flex align-items-center gap-2 flex-wrap justify-content-end">
                 <select
@@ -669,8 +900,7 @@ onUnmounted(() => {
               </div>
             </div>
             <div
-              class="border rounded overflow-auto bg-dark p-2 text-center flex-grow-1 d-flex align-items-start justify-content-center preview-viewport-box"
-              style="min-height: 200px"
+              class="border rounded overflow-auto bg-dark p-2 text-center flex-grow-1 d-flex align-items-start justify-content-center preview-viewport-box min-h-0"
             >
               <div v-if="imgSrc" class="position-relative d-inline-block">
                 <img
@@ -689,19 +919,20 @@ onUnmounted(() => {
                 />
               </div>
               <div v-else-if="previewPlaceholder" class="text-secondary py-5 px-3">
-                <p class="mb-2 fw-semibold">No live browser tab</p>
+                <p class="mb-2 fw-semibold">No live browser tab yet</p>
                 <p class="small mb-0 text-muted">
-                  A tab is created when this session runs a browser action (navigate, observe, etc.). Chat-only turns stay
-                  tab-free.
+                  Preview stays connected to this session. A tab opens when the agent runs a browser action; then video
+                  starts automatically.
                 </p>
               </div>
+              <p v-else-if="previewTabReady" class="text-secondary mb-0 py-5">Tab opened — loading preview…</p>
               <p v-else-if="previewStatus === 'no_session'" class="text-secondary mb-0 py-5">Select a session for preview.</p>
               <p v-else class="text-secondary mb-0 py-5">Connecting…</p>
             </div>
-            <p class="text-muted small mt-2 mb-0 flex-shrink-0">
+            <p class="text-muted small mt-2 mb-0 flex-shrink-0 preview-footnote">
               <template v-if="imgSrc && remoteMouseEnabled">Mouse on the image is sent to this session's tab.</template>
               <template v-else-if="imgSrc">Read-only preview unless Remote mouse is on.</template>
-              <template v-else-if="sessionId">Preview is per session; shown when a tab exists for it.</template>
+              <template v-else-if="sessionId">Preview WebSocket is per session; frames stream once a tab exists.</template>
               <template v-else>Pick a session to attach preview.</template>
             </p>
           </div>
@@ -712,15 +943,33 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.app-shell {
+  box-sizing: border-box;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
 .main-row {
-  min-height: 72vh;
+  flex: 1 1 auto;
+  min-height: 0;
   align-items: stretch;
+  overflow: hidden;
+}
+.sidebar-col {
+  min-height: 0;
 }
 .workspace-root {
-  min-height: 72vh;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
 }
 .workspace-body {
-  min-height: min(68vh, 900px);
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
 }
 .workspace-body.is-split .panel-chat,
 .workspace-body.is-split .panel-preview {
@@ -732,6 +981,10 @@ onUnmounted(() => {
 .panel-chat,
 .panel-preview {
   min-width: 0;
+  overflow: hidden;
+}
+.min-h-0 {
+  min-height: 0;
 }
 .split-gutter {
   width: 6px;
@@ -740,6 +993,7 @@ onUnmounted(() => {
   background: var(--bs-border-color);
   border-radius: 2px;
   align-self: stretch;
+  flex-shrink: 0;
 }
 .split-gutter:hover {
   background: var(--bs-secondary-color);
@@ -774,12 +1028,26 @@ onUnmounted(() => {
   max-height: none;
 }
 .session-list {
-  max-height: 50vh;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
 }
+.session-row.active .session-delete {
+  color: #f8a4a9;
+}
+.session-row.active .session-delete:hover {
+  color: #fff;
+}
+.session-meta {
+  font-size: 0.65rem;
+}
+.session-select:focus-visible {
+  outline: 2px solid var(--bs-primary);
+  outline-offset: 1px;
+}
 .session-live-dot {
-  width: 8px;
-  height: 8px;
+  width: 5px;
+  height: 5px;
   border-radius: 50%;
   background: var(--bs-secondary-bg);
   border: 1px solid var(--bs-border-color);
@@ -787,7 +1055,7 @@ onUnmounted(() => {
 .session-live-dot.on {
   background: #198754;
   border-color: #146c43;
-  box-shadow: 0 0 0 1px rgba(25, 135, 84, 0.35);
+  box-shadow: 0 0 0 1px rgba(25, 135, 84, 0.28);
 }
 .session-md :deep(p:last-child) {
   margin-bottom: 0;
@@ -804,12 +1072,13 @@ onUnmounted(() => {
   border-radius: 0.2rem;
 }
 .preview-viewport-box {
-  max-height: min(60vh, 820px);
+  max-height: none;
 }
 .preview-col {
   max-height: none;
 }
-.workspace-body:not(.is-split) .preview-viewport-box {
-  max-height: min(72vh, 900px);
+.preview-footnote {
+  max-height: 4.5rem;
+  overflow-y: auto;
 }
 </style>

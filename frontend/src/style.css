@@ -50,8 +50,10 @@
   }
 }
 
+html,
 body {
   margin: 0;
+  height: 100%;
 }
 
 h1,
@@ -157,15 +159,23 @@ code {
 }
 
 #app {
-  width: 1126px;
+  width: 100%;
   max-width: 100%;
-  margin: 0 auto;
-  text-align: center;
+  margin: 0;
+  text-align: initial;
   border-inline: 1px solid var(--border);
-  min-height: 100svh;
+  min-height: 100%;
+  height: 100%;
   display: flex;
   flex-direction: column;
   box-sizing: border-box;
+}
+
+#app > * {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 #center {

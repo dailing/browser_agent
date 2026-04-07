@@ -139,17 +139,20 @@ async def lifespan(app: FastAPI):
     )
     await _browser.start()
 
+    _publisher = PreviewPublisher(interval_ms=PREVIEW_MS, browser=_browser)
+    _publisher.start()
+
     async def _broadcast_live_tab(sid: str, has_tab: bool) -> None:
         if _fanout is not None:
             await _fanout.broadcast(
                 sid,
                 {"type": "live_tab", "session_id": sid, "has_live_tab": has_tab},
             )
+        if has_tab and _publisher is not None:
+            await _publisher.wake_tab_waiters(sid)
 
     _browser.set_on_live_tab(_broadcast_live_tab)
     _coordinator = RunCoordinator(_REPO_ROOT, _browser, _session_store, _fanout, _audit)
-    _publisher = PreviewPublisher(interval_ms=PREVIEW_MS, browser=_browser)
-    _publisher.start()
     yield
     if _publisher is not None:
         await _publisher.stop()
@@ -235,6 +238,28 @@ async def set_browser_viewport(body: SetViewportBody):
             {"type": "browser_viewport", "preset_id": body.preset_id, "width": w, "height": h}
         )
     return {"ok": True, "width": w, "height": h, "preset_id": body.preset_id}
+
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session(session_id: str):
+    if _session_store is None or _fanout is None:
+        raise HTTPException(status_code=503, detail="server not ready")
+    async with _op_lock(session_id):
+        s = await _session_store.get(session_id)
+        if s is None:
+            raise HTTPException(status_code=404, detail="not found")
+        if s.status == "running":
+            raise HTTPException(status_code=409, detail="agent_busy")
+        deleted = await _session_store.delete(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="not found")
+    if _browser is not None:
+        await _browser.close_tab(session_id)
+    await _fanout.drop_session(session_id)
+    if _publisher is not None:
+        await _publisher.drop_session(session_id)
+    _session_op_locks.pop(session_id, None)
+    return {"ok": True}
 
 
 @app.get("/api/sessions/{session_id}")

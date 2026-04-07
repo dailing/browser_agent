@@ -116,3 +116,12 @@ class DbSessionStore:
                 .values(status=status, error=error, updated_at=now)
             )
             await db.commit()
+
+    async def delete(self, session_id: str) -> bool:
+        async with self._sf() as db:
+            srow = await db.get(SessionRow, session_id)
+            if srow is None:
+                return False
+            await db.delete(srow)
+            await db.commit()
+        return True
