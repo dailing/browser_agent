@@ -17,6 +17,10 @@ from browser_agent.preview_publisher import PreviewPublisher
 from browser_agent.run_coordinator import RunCoordinator
 from browser_agent.session_fanout import SessionFanout
 from browser_agent.session_store import DbSessionStore
+from browser_agent.viewport_presets import (
+    initial_viewport_from_presets,
+    load_viewport_config,
+)
 
 START_URL = os.environ.get("BROWSER_AGENT_START_URL", "https://example.com")
 HOST = os.environ.get("BROWSER_AGENT_HOST", "127.0.0.1")
@@ -34,6 +38,8 @@ _session_store: DbSessionStore | None = None
 _fanout: SessionFanout | None = None
 _coordinator: RunCoordinator | None = None
 _session_op_locks: dict[str, asyncio.Lock] = {}
+_viewport_presets: list[dict] = []
+_preset_by_id: dict[str, dict] = {}
 
 
 def _op_lock(session_id: str) -> asyncio.Lock:
@@ -92,9 +98,14 @@ class PushMessageBody(BaseModel):
     text: str = Field(min_length=1)
 
 
+class SetViewportBody(BaseModel):
+    preset_id: str = Field(min_length=1, max_length=64)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _publisher, _browser, _audit, _engine, _session_store, _fanout, _coordinator
+    global _viewport_presets, _preset_by_id
     jsonl_path, _ = setup_process_logging(_REPO_ROOT)
     _audit = JsonlAudit(jsonl_path)
     _audit.emit({"type": "process_boot", "pid": os.getpid()})
@@ -102,7 +113,11 @@ async def lifespan(app: FastAPI):
     await create_schema(_engine)
     _session_store = DbSessionStore(make_session_factory(_engine))
     _fanout = SessionFanout()
-    _browser = BrowserManager(START_URL)
+    presets, default_vp_id = load_viewport_config(_REPO_ROOT)
+    _viewport_presets = list(presets)
+    _preset_by_id = {str(p["id"]): p for p in _viewport_presets}
+    initial_vp = initial_viewport_from_presets(_viewport_presets, default_vp_id)
+    _browser = BrowserManager(START_URL, viewport=initial_vp)
     await _browser.start()
     _coordinator = RunCoordinator(_REPO_ROOT, _browser, _session_store, _fanout, _audit)
     _publisher = PreviewPublisher(interval_ms=PREVIEW_MS)
@@ -161,6 +176,32 @@ async def list_sessions():
     if _session_store is None:
         raise HTTPException(status_code=503, detail="server not ready")
     return await _session_store.list_summaries()
+
+
+@app.get("/api/browser/viewport")
+async def get_browser_viewport():
+    if _browser is None:
+        raise HTTPException(status_code=503, detail="server not ready")
+    vs = _browser.page.viewport_size
+    return {
+        "presets": list(_viewport_presets),
+        "current": {"width": vs["width"], "height": vs["height"]},
+    }
+
+
+@app.post("/api/browser/viewport")
+async def set_browser_viewport(body: SetViewportBody):
+    if _browser is None:
+        raise HTTPException(status_code=503, detail="server not ready")
+    preset = _preset_by_id.get(body.preset_id)
+    if preset is None:
+        raise HTTPException(status_code=400, detail="unknown preset_id")
+    w, h = await _browser.set_viewport_size(int(preset["width"]), int(preset["height"]))
+    if _audit is not None:
+        _audit.emit(
+            {"type": "browser_viewport", "preset_id": body.preset_id, "width": w, "height": h}
+        )
+    return {"ok": True, "width": w, "height": h, "preset_id": body.preset_id}
 
 
 @app.get("/api/sessions/{session_id}")

@@ -23,6 +23,10 @@ const previewStatus = ref('connecting')
 const viewportWidth = ref(0)
 const viewportHeight = ref(0)
 const remoteMouseEnabled = ref(false)
+const viewportPresets = ref([])
+const viewportPresetId = ref('')
+const viewportApplyBusy = ref(false)
+const VIEWPORT_LS_KEY = 'browser_agent_viewport_preset'
 let previewWs = null
 let previewReconnectTimer = null
 let sessionWs = null
@@ -263,9 +267,60 @@ watch(remoteMouseEnabled, (on) => {
   }
 })
 
+async function loadViewportOptions() {
+  try {
+    const r = await fetch('/api/browser/viewport')
+    if (!r.ok) return
+    const j = await r.json()
+    const list = j.presets || []
+    viewportPresets.value = list
+    if (!list.length) return
+    const saved = localStorage.getItem(VIEWPORT_LS_KEY)
+    const savedOk = saved && list.some((p) => p.id === saved)
+    let pick = savedOk ? saved : null
+    if (!pick) {
+      const c = j.current
+      const match = list.find((p) => p.width === c.width && p.height === c.height)
+      pick = match ? match.id : list[0].id
+    }
+    viewportPresetId.value = pick
+    const chosen = list.find((p) => p.id === pick)
+    const cur = j.current
+    if (chosen && (chosen.width !== cur.width || chosen.height !== cur.height)) {
+      await applyViewportPreset(false)
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+async function onViewportPresetChange() {
+  await applyViewportPreset(true)
+}
+
+async function applyViewportPreset(saveLs) {
+  const id = viewportPresetId.value
+  if (!id || viewportApplyBusy.value) return
+  viewportApplyBusy.value = true
+  try {
+    const r = await fetch('/api/browser/viewport', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preset_id: id }),
+    })
+    if (!r.ok) throw new Error((await r.text()) || r.statusText)
+    if (saveLs) localStorage.setItem(VIEWPORT_LS_KEY, id)
+  } catch {
+    /* keep selection; next preview frame may still show old size */
+  } finally {
+    viewportApplyBusy.value = false
+  }
+}
+
 onMounted(() => {
   connectPreview()
   loadSessions()
+  loadViewportOptions()
 })
 onUnmounted(() => {
   if (previewMoveRaf != null) cancelAnimationFrame(previewMoveRaf)
@@ -374,10 +429,21 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <div class="col-lg-5 d-flex flex-column" style="min-width: 280px">
+      <div class="col-lg-5 d-flex flex-column preview-col" style="min-width: 280px">
         <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
           <h2 class="h5 mb-0">Browser preview</h2>
-          <div class="d-flex align-items-center gap-2">
+          <div class="d-flex align-items-center gap-2 flex-wrap justify-content-end">
+            <select
+              v-if="viewportPresets.length"
+              v-model="viewportPresetId"
+              class="form-select form-select-sm"
+              style="width: auto; min-width: 11rem; max-width: 16rem"
+              title="Browser viewport size"
+              :disabled="viewportApplyBusy"
+              @change="onViewportPresetChange"
+            >
+              <option v-for="p in viewportPresets" :key="p.id" :value="p.id">{{ p.label }}</option>
+            </select>
             <div v-if="imgSrc && viewportWidth" class="form-check form-switch m-0">
               <input
                 id="remote-mouse"
@@ -392,9 +458,17 @@ onUnmounted(() => {
             <span class="badge text-bg-secondary text-capitalize">{{ previewStatus }}</span>
           </div>
         </div>
-        <div class="border rounded overflow-hidden bg-dark p-2 text-center flex-grow-1 d-flex align-items-center justify-content-center" style="min-height: 200px">
+        <div
+          class="border rounded overflow-auto bg-dark p-2 text-center flex-grow-1 d-flex align-items-start justify-content-center preview-viewport-box"
+          style="min-height: 200px"
+        >
           <div v-if="imgSrc" class="position-relative d-inline-block">
-            <img :src="imgSrc" alt="viewport" class="img-fluid" style="zoom: 0.85; max-width: 100%; display: block; user-select: none; pointer-events: none" />
+            <img
+              :src="imgSrc"
+              alt="viewport"
+              class="img-fluid d-block"
+              style="max-width: 100%; height: auto; user-select: none; pointer-events: none"
+            />
             <div
               v-show="remoteMouseEnabled && viewportWidth"
               class="position-absolute top-0 start-0 end-0 bottom-0 remote-mouse-overlay"
@@ -433,5 +507,11 @@ onUnmounted(() => {
   padding: 0.1rem 0.25rem;
   background: var(--bs-tertiary-bg);
   border-radius: 0.2rem;
+}
+.preview-viewport-box {
+  max-height: min(72vh, 900px);
+}
+.preview-col {
+  max-height: 85vh;
 }
 </style>

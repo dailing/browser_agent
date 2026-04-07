@@ -4,5 +4,17 @@
     "base_url": "https://api.minimax.io/v1",
     "model": "MiniMax-M2.7",
     "temperature": 0.2
+  },
+  "browser": {
+    "default_viewport_preset_id": "1280x720",
+    "viewport_presets": [
+      { "id": "1280x720", "label": "Landscape 1280x720", "width": 1280, "height": 720 },
+      { "id": "1600x900", "label": "Landscape 1600x900", "width": 1600, "height": 900 },
+      { "id": "1920x1080", "label": "Landscape 1920x1080", "width": 1920, "height": 1080 },
+      { "id": "720x1280", "label": "Portrait 720x1280", "width": 720, "height": 1280 },
+      { "id": "900x1200", "label": "Portrait 900x1200", "width": 900, "height": 1200 },
+      { "id": "834x1112", "label": "Tablet portrait 834x1112", "width": 834, "height": 1112 },
+      { "id": "390x844", "label": "Phone 390x844", "width": 390, "height": 844 }
+    ]
   }
 }
