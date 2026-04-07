@@ -34,7 +34,7 @@ const SPLIT_PCT_LS_KEY = 'browser_agent_split_pct'
 
 const MIN_CHAT_W = 220
 const MIN_PREVIEW_W = 200
-const GUTTER_W = 36
+const GUTTER_W = 4
 
 function readInitialSplitPct() {
   const n = Number(typeof localStorage !== 'undefined' ? localStorage.getItem(SPLIT_PCT_LS_KEY) : NaN)
@@ -740,7 +740,7 @@ onUnmounted(() => {
           </div>
 
           <div
-            class="split-gutter-wrap flex-shrink-0 border border-secondary rounded-2 bg-body-secondary shadow-sm"
+            class="split-gutter-wrap flex-shrink-0"
             :title="bothPanelsOpen ? 'Drag to resize chat and preview' : ''"
           >
             <div
@@ -865,26 +865,47 @@ onUnmounted(() => {
 }
 .split-gutter-wrap {
   position: relative;
-  width: 36px;
-  min-width: 36px;
+  width: 4px;
+  min-width: 4px;
   flex-shrink: 0;
   align-self: stretch;
   z-index: 2;
 }
 .split-gutter-drag {
   position: absolute;
-  inset: 0;
-  border-radius: 3px;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 20px;
+  margin-left: -10px;
   cursor: col-resize;
-  background: var(--bs-border-color);
+  background: transparent;
+  border: 0;
+  padding: 0;
+  border-radius: 0;
 }
-.split-gutter-drag:hover:not(.split-gutter-drag-disabled) {
+.split-gutter-drag::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  transform: translateX(-50%);
+  background: var(--bs-border-color);
+  border-radius: 1px;
+  pointer-events: none;
+}
+.split-gutter-drag:hover:not(.split-gutter-drag-disabled)::after {
   background: var(--bs-secondary-color);
+  width: 3px;
 }
 .split-gutter-drag-disabled {
   cursor: default;
   pointer-events: none;
-  opacity: 0.45;
+}
+.split-gutter-drag-disabled::after {
+  opacity: 0.35;
 }
 .split-gutter-fabs {
   position: absolute;
@@ -894,20 +915,20 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 10px;
-  z-index: 1;
+  gap: 8px;
+  z-index: 4;
   pointer-events: none;
 }
 .gutter-fab {
   pointer-events: auto;
-  width: 22px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
   padding: 0;
   border-radius: 50%;
   border: 1px solid var(--bs-border-color);
   background: var(--bs-body-bg);
   color: var(--bs-secondary-color);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+  box-shadow: 0 0 0 1px var(--bs-body-bg), 0 1px 3px rgba(0, 0, 0, 0.12);
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -927,8 +948,8 @@ onUnmounted(() => {
   opacity: 0.45;
 }
 .gutter-fab-icon {
-  width: 11px;
-  height: 11px;
+  width: 10px;
+  height: 10px;
   display: block;
 }
 .session-row.active .session-delete {
