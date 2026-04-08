@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
 from browser_agent.viewport_presets import MAX_VIEWPORT_H, MAX_VIEWPORT_W, MIN_VIEWPORT
@@ -16,8 +16,12 @@ LiveTabCallback = Callable[[str, bool], Awaitable[None]]
 @dataclass
 class SessionTab:
     context: BrowserContext
-    page: Page
-    last_activity_monotonic: float
+    page_stack: list[Page] = field(default_factory=list)
+    last_activity_monotonic: float = 0.0
+
+    @property
+    def page(self) -> Page:
+        return self.page_stack[-1]
 
 
 class BrowserManager:
@@ -46,16 +50,75 @@ class BrowserManager:
         return dict(self._initial_viewport)
 
     def has_live_tab(self, session_id: str) -> bool:
-        return session_id in self._tabs
+        t = self._tabs.get(session_id)
+        return bool(t and t.page_stack)
+
+    def stack_depth(self, session_id: str) -> int:
+        t = self._tabs.get(session_id)
+        return len(t.page_stack) if t else 0
 
     def get_page_if_exists(self, session_id: str) -> Page | None:
         t = self._tabs.get(session_id)
-        return t.page if t else None
+        if not t or not t.page_stack:
+            return None
+        return t.page_stack[-1]
 
     def touch_tab_activity_if_exists(self, session_id: str) -> None:
         t = self._tabs.get(session_id)
         if t:
             t.last_activity_monotonic = time.monotonic()
+
+    def _schedule_handle_new_page(self, session_id: str, page: Page) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._handle_new_page(session_id, page))
+
+    def _schedule_on_page_closed(self, session_id: str, page: Page) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._on_page_closed(session_id, page))
+
+    def _register_page_close(self, session_id: str, page: Page) -> None:
+        page.once("close", lambda: self._schedule_on_page_closed(session_id, page))
+
+    async def _handle_new_page(self, session_id: str, page: Page) -> None:
+        async with self._lock:
+            t = self._tabs.get(session_id)
+            if t is None:
+                return
+            try:
+                await page.set_viewport_size(dict(self._initial_viewport))
+            except Exception:
+                pass
+            t.page_stack.append(page)
+            self._register_page_close(session_id, page)
+
+    async def _on_page_closed(self, session_id: str, page: Page) -> None:
+        ctx_to_close: BrowserContext | None = None
+        emit_sid: str | None = None
+        async with self._lock:
+            t = self._tabs.get(session_id)
+            if not t:
+                return
+            try:
+                t.page_stack.remove(page)
+            except ValueError:
+                return
+            if not t.page_stack:
+                ctx_to_close = t.context
+                self._tabs.pop(session_id, None)
+                emit_sid = session_id
+        if ctx_to_close is not None:
+            try:
+                await ctx_to_close.close()
+            except Exception:
+                pass
+        if emit_sid is not None:
+            await self._emit_live_tab(emit_sid, False)
 
     async def ensure_page(self, session_id: str) -> Page:
         if self._browser is None:
@@ -67,13 +130,106 @@ class BrowserManager:
                 page = await ctx.new_page()
                 await page.goto(self._start_url, wait_until="domcontentloaded")
                 mono = time.monotonic()
-                self._tabs[session_id] = SessionTab(context=ctx, page=page, last_activity_monotonic=mono)
+                t = SessionTab(context=ctx, page_stack=[page], last_activity_monotonic=mono)
+                self._register_page_close(session_id, page)
+
+                def _on_page(p: Page) -> None:
+                    self._schedule_handle_new_page(session_id, p)
+
+                ctx.on("page", _on_page)
+                self._tabs[session_id] = t
                 await self._emit_live_tab(session_id, True)
             else:
                 t.last_activity_monotonic = time.monotonic()
-            return self._tabs[session_id].page
+                if not t.page_stack:
+                    page = await t.context.new_page()
+                    await page.goto(self._start_url, wait_until="domcontentloaded")
+                    t.page_stack.append(page)
+                    self._register_page_close(session_id, page)
+                    await self._emit_live_tab(session_id, True)
+            return t.page_stack[-1]
+
+    async def stabilize_after_action(
+        self, session_id: str, *, stabilize_ms: int, wait_load_state: bool
+    ) -> None:
+        if stabilize_ms > 0:
+            await asyncio.sleep(stabilize_ms / 1000.0)
+        page = self.get_page_if_exists(session_id)
+        if page is None or not wait_load_state:
+            return
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=30_000)
+        except Exception:
+            pass
+
+    async def format_stack_report(self, session_id: str, depth_before: int) -> str:
+        lines: list[str] = ["---"]
+        t = self._tabs.get(session_id)
+        depth = len(t.page_stack) if t else 0
+        if depth > depth_before:
+            lines.append(f"Notice: new tab is now active (stack depth {depth}).")
+        if not t or not t.page_stack:
+            lines.append("Stack: depth=0 (no active tab)")
+            return "\n".join(lines)
+        lines.append(f"Stack: depth={depth}")
+        for i, p in enumerate(t.page_stack):
+            mark = "*" if i == depth - 1 else " "
+            url = ""
+            title = ""
+            try:
+                url = p.url or ""
+            except Exception:
+                url = ""
+            try:
+                title = await p.title()
+            except Exception:
+                title = ""
+            prefix = f"  [{i + 1}]{mark}"
+            lines.append(f"{prefix} url={url[:500]}")
+            if title:
+                lines.append(f"       title={title[:200]}")
+        top = t.page_stack[-1]
+        active_url = ""
+        active_title = ""
+        try:
+            active_url = top.url or ""
+        except Exception:
+            pass
+        try:
+            active_title = await top.title()
+        except Exception:
+            active_title = ""
+        lines.append(f"Active: url={active_url[:800]} title={active_title[:200] if active_title else ''}")
+        return "\n".join(lines)
+
+    async def close_current_page(self, session_id: str) -> str:
+        top: Page | None = None
+        async with self._lock:
+            t = self._tabs.get(session_id)
+            if t is None or not t.page_stack:
+                return "error: no active tab"
+            top = t.page_stack.pop()
+        try:
+            await top.close()
+        except Exception:
+            pass
+        ctx_to_close: BrowserContext | None = None
+        async with self._lock:
+            t = self._tabs.get(session_id)
+            if t is not None and not t.page_stack:
+                ctx_to_close = t.context
+                self._tabs.pop(session_id, None)
+        if ctx_to_close is not None:
+            try:
+                await ctx_to_close.close()
+            except Exception:
+                pass
+            await self._emit_live_tab(session_id, False)
+            return "closed current tab; no tabs left in session"
+        return "closed current tab"
 
     async def close_tab(self, session_id: str, *, reason: str = "idle") -> None:
+        """Close the entire browser context for this session (all tabs)."""
         async with self._lock:
             t = self._tabs.pop(session_id, None)
         if t is None:
@@ -105,7 +261,11 @@ class BrowserManager:
         self._initial_viewport = {"width": w, "height": h}
         async with self._lock:
             for t in self._tabs.values():
-                await t.page.set_viewport_size({"width": w, "height": h})
+                for p in t.page_stack:
+                    try:
+                        await p.set_viewport_size({"width": w, "height": h})
+                    except Exception:
+                        pass
         return w, h
 
     async def start(self) -> None:

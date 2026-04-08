@@ -54,3 +54,13 @@ class PageContextBuilder:
         if len(outline) > _MAX_CHARS:
             outline = outline[:_MAX_CHARS] + "\n\n[truncated]"
         return outline
+
+    @staticmethod
+    async def build_aria_snapshot(page: Page) -> str:
+        title = await page.title()
+        url = page.url
+        snap = await page.locator("html").aria_snapshot()
+        outline = f"URL: {url}\nTitle: {title}\nARIA snapshot:\n{snap}"
+        if len(outline) > _MAX_CHARS:
+            outline = outline[:_MAX_CHARS] + "\n\n[truncated]"
+        return outline

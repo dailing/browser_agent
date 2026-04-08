@@ -8,7 +8,6 @@ from typing import Any, ClassVar
 from playwright.async_api import Page
 
 from browser_agent.actions.base import AgentAction
-from browser_agent.page_context_builder import PageContextBuilder
 
 _REF_SEL = re.compile(r"^[1-9]\d*$")
 
@@ -32,8 +31,25 @@ class GetObservationAction(AgentAction):
         session_id: str,
         args: dict[str, Any],
     ) -> str:
-        assert page is not None
-        return await PageContextBuilder.build(page)
+        return ""
+
+
+class GetDetailedObservationAction(AgentAction):
+    description: ClassVar[str] = (
+        "Detailed page context: URL, title, and an ARIA snapshot (YAML) of the document "
+        "for visible structure and text. Does not add [ref=N]; use get_observation for clickable refs."
+    )
+    parameters: ClassVar[dict[str, Any]] = {"type": "object", "properties": {}}
+
+    async def __call__(
+        self,
+        *,
+        page: Page | None,
+        repo_root: Path,
+        session_id: str,
+        args: dict[str, Any],
+    ) -> str:
+        return ""
 
 
 class NavigateAction(AgentAction):
@@ -248,6 +264,8 @@ class SelectOptionAction(AgentAction):
 
 
 class ScreenshotViewportJpegAction(AgentAction):
+    """Not registered in agent tool specs; kept for reuse or manual wiring."""
+
     description: ClassVar[str] = (
         "Save a viewport JPEG under log/screenshots for debugging or archival."
     )
@@ -269,6 +287,24 @@ class ScreenshotViewportJpegAction(AgentAction):
         path = out_dir / fname
         path.write_bytes(buf)
         return f"saved {path.relative_to(repo_root)}"
+
+
+class CloseCurrentTabAction(AgentAction):
+    description: ClassVar[str] = (
+        "Close the active (top) browser tab for this session. The previous tab in the stack "
+        "becomes active. If it was the last tab, the session has no live browser until the next action."
+    )
+    parameters: ClassVar[dict[str, Any]] = {"type": "object", "properties": {}}
+
+    async def __call__(
+        self,
+        *,
+        page: Page | None,
+        repo_root: Path,
+        session_id: str,
+        args: dict[str, Any],
+    ) -> str:
+        return ""
 
 
 class ExportPagePdfAction(AgentAction):

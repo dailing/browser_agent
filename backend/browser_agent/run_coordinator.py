@@ -1,6 +1,5 @@
 import json
 import os
-import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -16,12 +15,16 @@ from browser_agent.session_fanout import SessionFanout
 from browser_agent.session_store import DbSessionStore
 from browser_agent.tools_spec import AGENT_TOOLS
 
-SYSTEM_PROMPT = """You control a headless Chromium tab via tools. The user cannot click; only you can.
+SYSTEM_PROMPT = """You control a headless Chromium session (one browser context) via tools. The user cannot click; only you can.
 The conversation may continue across multiple user messages: answer the latest request using full prior context.
 Rules:
-- After navigate or go_back, call get_observation before clicking or filling.
+- Links may open new tabs in the same session. Every browser tool result ends with a Stack section: depth, each tab URL, and Active (top) tab. If you see Notice: new tab is now active, the top tab changed; call get_observation before using refs from an older observation.
+- Refs ([ref=N]) are valid only for the page described by the latest get_observation on the current active (top) tab. Do not reuse refs from a previous tab or an outdated observation.
+- get_detailed_observation returns an ARIA snapshot (YAML) for page text and structure; it does not include [ref=N]. Use it to understand content; use get_observation for refs before click/fill.
+- After navigate or go_back, call get_observation before clicking or filling (and get_detailed_observation when you need fuller text/context).
 - Use refs exactly as shown in observations ([ref=N]). Do not invent refs.
 - Prefer small steps: observe, act, observe again.
+- Use close_current_tab to dismiss the active tab and return to the previous one in the stack when you are done with a popup tab.
 - To turn a page into markdown text: export_page_pdf (saves under log/pdf), then convert_pdf_to_markdown with that pdf_path (relative to project root). The tool returns markdown and a download URL from the PDF Reader API.
 - When the user's request is fully satisfied for this turn, call done with a concise summary.
 - If stuck after retries, call done summarizing what blocked you."""
@@ -45,7 +48,7 @@ def _assistant_api_dict(msg) -> dict[str, Any]:
 
 
 def _tool_result_audit_content(name: str, result: str) -> str | dict[str, Any]:
-    if name == "get_observation" and len(result) > 6000:
+    if name in ("get_observation", "get_detailed_observation") and len(result) > 6000:
         return {"truncated": True, "head": result[:6000], "total_len": len(result)}
     if name == "convert_pdf_to_markdown" and len(result) > 8000:
         return {"truncated": True, "head": result[:8000], "total_len": len(result)}
@@ -80,19 +83,6 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _resolve_tool_call_delay_ms(repo_root: Path) -> int:
-    data = _read_json_object(_config_path(repo_root))
-    browser = data.get("browser")
-    if not isinstance(browser, dict):
-        return 0
-    raw = browser.get("tool_call_delay_ms", 0)
-    try:
-        ms = int(raw)
-    except (TypeError, ValueError):
-        return 0
-    return max(0, ms)
-
-
 def _invalid_tool_call_argument_error(msg) -> str | None:
     if not msg.tool_calls:
         return None
@@ -122,7 +112,6 @@ class RunCoordinator:
         self._store = store
         self._fanout = fanout
         self._audit = audit
-        self._tool_call_delay_ms = _resolve_tool_call_delay_ms(repo_root)
 
     async def _append_and_broadcast(self, session_id: str, message: dict[str, Any]) -> None:
         await self._store.append_message(session_id, message)
@@ -297,8 +286,6 @@ class RunCoordinator:
                         tool_payload = {"role": "tool", "tool_call_id": tc.id, "content": result}
                         messages.append(tool_payload)  # type: ignore[arg-type]
                         await self._append_and_broadcast(session_id, tool_payload)
-                        if self._tool_call_delay_ms > 0:
-                            await asyncio.sleep(self._tool_call_delay_ms / 1000.0)
 
                         if name == "done":
                             await self._store.set_status(session_id, "idle", None)
