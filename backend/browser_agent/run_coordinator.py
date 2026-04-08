@@ -1,4 +1,6 @@
 import json
+import os
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +62,52 @@ def _first_user_task_preview(messages: list[dict[str, Any]], limit: int = 500) -
     return ""
 
 
+def _config_path(repo_root: Path) -> Path:
+    override = os.environ.get("BROWSER_AGENT_CONFIG")
+    if override:
+        return Path(override).expanduser().resolve()
+    return repo_root / "config.json"
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _resolve_tool_call_delay_ms(repo_root: Path) -> int:
+    data = _read_json_object(_config_path(repo_root))
+    browser = data.get("browser")
+    if not isinstance(browser, dict):
+        return 0
+    raw = browser.get("tool_call_delay_ms", 0)
+    try:
+        ms = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, ms)
+
+
+def _invalid_tool_call_argument_error(msg) -> str | None:
+    if not msg.tool_calls:
+        return None
+    for tc in msg.tool_calls:
+        raw = tc.function.arguments or "{}"
+        try:
+            json.loads(raw)
+        except json.JSONDecodeError as e:
+            return (
+                f"invalid tool arguments from model: tool={tc.function.name} id={tc.id} "
+                f"error={e.msg} at line {e.lineno} col {e.colno}"
+            )
+    return None
+
+
 class RunCoordinator:
     def __init__(
         self,
@@ -74,6 +122,7 @@ class RunCoordinator:
         self._store = store
         self._fanout = fanout
         self._audit = audit
+        self._tool_call_delay_ms = _resolve_tool_call_delay_ms(repo_root)
 
     async def _append_and_broadcast(self, session_id: str, message: dict[str, Any]) -> None:
         await self._store.append_message(session_id, message)
@@ -130,17 +179,48 @@ class RunCoordinator:
 
         turn = 0
         stop_reason: str | None = None
+        llm_invalid_args_retries = 3
         try:
             while turn < max_steps:
                 turn += 1
-                choice = await llm.chat(
-                    messages,
-                    AGENT_TOOLS,
-                    session_id=session_id,
-                    turn=turn,
-                    audit=self._audit,
-                )
-                msg = choice.message
+                msg = None
+                last_invalid_error: str | None = None
+                for attempt in range(1, llm_invalid_args_retries + 1):
+                    choice = await llm.chat(
+                        messages,
+                        AGENT_TOOLS,
+                        session_id=session_id,
+                        turn=turn,
+                        audit=self._audit,
+                    )
+                    candidate = choice.message
+                    invalid_err = _invalid_tool_call_argument_error(candidate)
+                    if invalid_err is None:
+                        msg = candidate
+                        break
+                    last_invalid_error = invalid_err
+                    self._audit.emit(
+                        {
+                            "type": "llm_invalid_tool_arguments",
+                            "session_id": session_id,
+                            "turn": turn,
+                            "attempt": attempt,
+                            "error": invalid_err,
+                        }
+                    )
+                if msg is None:
+                    err = (
+                        f"llm produced invalid tool arguments after {llm_invalid_args_retries} attempts: "
+                        f"{last_invalid_error or 'unknown_error'}"
+                    )
+                    await self._store.set_status(session_id, "failed", err)
+                    self._audit.emit({"type": "run_failed", "session_id": session_id, "error": err})
+                    await self._append_and_broadcast(
+                        session_id,
+                        {"role": "assistant", "content": f"_Run error: {err}_"},
+                    )
+                    stop_reason = "invalid_tool_arguments"
+                    break
 
                 if not msg.tool_calls and (msg.content or "").strip():
                     rec = _assistant_api_dict(msg)
@@ -205,6 +285,8 @@ class RunCoordinator:
                         tool_payload = {"role": "tool", "tool_call_id": tc.id, "content": result}
                         messages.append(tool_payload)  # type: ignore[arg-type]
                         await self._append_and_broadcast(session_id, tool_payload)
+                        if self._tool_call_delay_ms > 0:
+                            await asyncio.sleep(self._tool_call_delay_ms / 1000.0)
 
                         if name == "done":
                             await self._store.set_status(session_id, "idle", None)
