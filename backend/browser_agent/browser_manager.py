@@ -126,7 +126,10 @@ class BrowserManager:
         async with self._lock:
             t = self._tabs.get(session_id)
             if t is None:
-                ctx = await self._browser.new_context(viewport=dict(self._initial_viewport))
+                ctx = await self._browser.new_context(
+                    viewport=dict(self._initial_viewport),
+                    accept_downloads=True,
+                )
                 page = await ctx.new_page()
                 await page.goto(self._start_url, wait_until="domcontentloaded")
                 mono = time.monotonic()

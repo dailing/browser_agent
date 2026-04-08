@@ -10,6 +10,7 @@ from playwright.async_api import Page
 from browser_agent.actions.base import AgentAction
 from browser_agent.actions.browser import (
     ClickAction,
+    ClickDownloadAction,
     CloseCurrentTabAction,
     ExportPagePdfAction,
     FillAction,
@@ -33,6 +34,7 @@ _TOOL_CLASSES: tuple[type[AgentAction], ...] = (
     NavigateAction,
     GoBackAction,
     ClickAction,
+    ClickDownloadAction,
     FillAction,
     PressKeyAction,
     ScrollAction,
@@ -51,6 +53,7 @@ TOOLS_REQUIRING_BROWSER: frozenset[str] = frozenset(
         NavigateAction.name,
         GoBackAction.name,
         ClickAction.name,
+        ClickDownloadAction.name,
         FillAction.name,
         PressKeyAction.name,
         ScrollAction.name,

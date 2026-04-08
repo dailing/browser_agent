@@ -16,6 +16,19 @@ def _ref_selector(ref: str) -> str:
     return f'[data-agent-ref="{ref}"]'
 
 
+def _save_path_under_repo(repo_root: Path, rel: str) -> Path | str:
+    raw = (rel or "").strip().replace("\\", "/")
+    if not raw or raw.startswith("..") or Path(raw).is_absolute():
+        return "error: save_path must be a non-empty relative path under the project root"
+    out = (repo_root / raw).resolve()
+    root = repo_root.resolve()
+    try:
+        out.relative_to(root)
+    except ValueError:
+        return "error: save_path must stay under the project root"
+    return out
+
+
 class GetObservationAction(AgentAction):
     description: ClassVar[str] = (
         "Refresh the structured view of the current page (URL, title, interactive elements "
@@ -115,6 +128,64 @@ class ClickAction(AgentAction):
             return "error: invalid ref"
         await page.click(_ref_selector(ref), timeout=15_000)
         return f"clicked ref={ref}"
+
+
+class ClickDownloadAction(AgentAction):
+    description: ClassVar[str] = (
+        "Click an element (ref from get_observation) that starts a browser download, "
+        "and save the file to save_path relative to the project root. Parent folders are created if needed."
+    )
+    parameters: ClassVar[dict[str, Any]] = {
+        "type": "object",
+        "properties": {
+            "ref": {"type": "string", "description": "Numeric ref from observation"},
+            "save_path": {
+                "type": "string",
+                "description": "Relative path under project root, e.g. log/downloads/file.pdf",
+            },
+            "timeout_ms": {
+                "type": "integer",
+                "description": "Max milliseconds to wait for the download to start after click (default 120000)",
+            },
+        },
+        "required": ["ref", "save_path"],
+    }
+
+    async def __call__(
+        self,
+        *,
+        page: Page | None,
+        repo_root: Path,
+        session_id: str,
+        args: dict[str, Any],
+    ) -> str:
+        assert page is not None
+        ref = str(args.get("ref", ""))
+        if not _REF_SEL.match(ref):
+            return "error: invalid ref"
+        rel = str(args.get("save_path", ""))
+        resolved = _save_path_under_repo(repo_root, rel)
+        if isinstance(resolved, str):
+            return resolved
+        raw_timeout = args.get("timeout_ms", 120_000)
+        try:
+            timeout_ms = int(raw_timeout)
+        except (TypeError, ValueError):
+            timeout_ms = 120_000
+        timeout_ms = max(1_000, min(timeout_ms, 600_000))
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            async with page.expect_download(timeout=timeout_ms) as dl_info:
+                await page.click(_ref_selector(ref), timeout=15_000)
+            download = await dl_info.value
+            await download.save_as(str(resolved))
+        except Exception as e:
+            return f"error: download failed: {e}"
+        suggest = download.suggested_filename or resolved.name
+        return (
+            f"saved download to {resolved.relative_to(repo_root)} "
+            f"(suggested_filename={suggest})"
+        )
 
 
 class FillAction(AgentAction):

@@ -25,6 +25,7 @@ Rules:
 - Use refs exactly as shown in observations ([ref=N]). Do not invent refs.
 - Prefer small steps: observe, act, observe again.
 - Use close_current_tab to dismiss the active tab and return to the previous one in the stack when you are done with a popup tab.
+- For a real file download (control that triggers the browser download): use click_download with ref and save_path (relative to project root, e.g. log/downloads/paper.pdf). Use click when no download is expected.
 - To turn a page into markdown text: export_page_pdf (saves under log/pdf), then convert_pdf_to_markdown with that pdf_path (relative to project root). The tool returns markdown and a download URL from the PDF Reader API.
 - When the user's request is fully satisfied for this turn, call done with a concise summary.
 - If stuck after retries, call done summarizing what blocked you."""
