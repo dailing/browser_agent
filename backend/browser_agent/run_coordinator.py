@@ -193,6 +193,16 @@ class RunCoordinator:
                         turn=turn,
                         audit=self._audit,
                     )
+                    if choice is None:
+                        err = "llm_request_failed_after_retries"
+                        await self._store.set_status(session_id, "failed", err)
+                        self._audit.emit({"type": "run_failed", "session_id": session_id, "error": err})
+                        await self._append_and_broadcast(
+                            session_id,
+                            {"role": "assistant", "content": f"_Run error: {err}_"},
+                        )
+                        stop_reason = "llm_request_failed"
+                        break
                     candidate = choice.message
                     invalid_err = _invalid_tool_call_argument_error(candidate)
                     if invalid_err is None:
@@ -208,6 +218,8 @@ class RunCoordinator:
                             "error": invalid_err,
                         }
                     )
+                if stop_reason == "llm_request_failed":
+                    break
                 if msg is None:
                     err = (
                         f"llm produced invalid tool arguments after {llm_invalid_args_retries} attempts: "

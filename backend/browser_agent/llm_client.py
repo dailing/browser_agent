@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -7,6 +8,8 @@ from openai.types.chat import ChatCompletionMessageParam
 
 from browser_agent.audit_logging import JsonlAudit
 from browser_agent.llm_config import resolve_llm_settings
+
+_OVERLOAD_RETRY_DELAYS_SEC = (30, 60, 120, 120)
 
 
 class LlmClient:
@@ -41,25 +44,52 @@ class LlmClient:
                 "messages": list(messages),
             }
         )
-        try:
-            resp = await self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto",
-                temperature=self._temperature,
-            )
-        except Exception as e:
-            logger.exception("LLM request failed")
-            audit.emit(
-                {
-                    "type": "llm_error",
-                    "session_id": session_id,
-                    "turn": turn,
-                    "error": str(e),
-                }
-            )
-            raise
+        for attempt in range(len(_OVERLOAD_RETRY_DELAYS_SEC) + 1):
+            try:
+                resp = await self._client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                    temperature=self._temperature,
+                )
+                break
+            except Exception as e:
+                will_retry = attempt < len(_OVERLOAD_RETRY_DELAYS_SEC)
+                audit.emit(
+                    {
+                        "type": "llm_error",
+                        "session_id": session_id,
+                        "turn": turn,
+                        "attempt": attempt + 1,
+                        "will_retry": will_retry,
+                        "error": str(e),
+                    }
+                )
+                if attempt < len(_OVERLOAD_RETRY_DELAYS_SEC):
+                    delay_sec = _OVERLOAD_RETRY_DELAYS_SEC[attempt]
+                    logger.warning(
+                        "LLM request failed; retrying in {}s (attempt {}/{})",
+                        delay_sec,
+                        attempt + 1,
+                        len(_OVERLOAD_RETRY_DELAYS_SEC),
+                    )
+                    audit.emit(
+                        {
+                            "type": "llm_retry",
+                            "session_id": session_id,
+                            "turn": turn,
+                            "attempt": attempt + 1,
+                            "delay_sec": delay_sec,
+                            "reason": "llm_request_error",
+                            "error": str(e),
+                        }
+                    )
+                    await asyncio.sleep(delay_sec)
+                    continue
+
+                logger.error("LLM request failed after retries: {}", e)
+                return None
 
         ch = resp.choices[0]
         msg = ch.message
