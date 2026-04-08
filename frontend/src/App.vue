@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import MarkdownIt from 'markdown-it'
+import { Toast } from 'bootstrap'
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
 
@@ -16,7 +17,6 @@ const messages = ref([])
 const runStatus = ref('')
 const draft = ref('')
 const sending = ref(false)
-const sendError = ref('')
 
 const logEl = ref(null)
 const imgSrc = ref('')
@@ -32,6 +32,14 @@ const viewportApplyBusy = ref(false)
 const VIEWPORT_LS_KEY = 'browser_agent_viewport_preset'
 const SPLIT_PCT_LS_KEY = 'browser_agent_split_pct'
 
+const mainView = ref('workspace')
+const skillsList = ref([])
+const loadingSkills = ref(false)
+const skillPanelId = ref(null)
+const skillDetail = ref(null)
+const loadingSkillDetail = ref(false)
+const composerSkillId = ref('')
+
 const MIN_CHAT_W = 220
 const MIN_PREVIEW_W = 200
 const GUTTER_W = 4
@@ -43,6 +51,27 @@ function readInitialSplitPct() {
 }
 const splitPct = ref(readInitialSplitPct())
 const workspaceBodyEl = ref(null)
+
+let toastSeq = 0
+const toastItems = ref([])
+
+function showAppToast(message, variant = 'warning') {
+  const text = String(message || '').trim()
+  if (!text) return
+  const id = ++toastSeq
+  toastItems.value = [...toastItems.value, { id, message: text, variant }]
+  nextTick(() => {
+    const el = document.getElementById(`app-toast-${id}`)
+    if (!el) return
+    const t = Toast.getOrCreateInstance(el, { autohide: true, delay: 6000 })
+    const onHidden = () => {
+      el.removeEventListener('hidden.bs.toast', onHidden)
+      toastItems.value = toastItems.value.filter((x) => x.id !== id)
+    }
+    el.addEventListener('hidden.bs.toast', onHidden)
+    t.show()
+  })
+}
 
 const chatCollapsed = ref(false)
 const previewCollapsed = ref(false)
@@ -81,7 +110,7 @@ function onSplitMouseDown(ev) {
   function onMove(e) {
     const dx = e.clientX - startX
     const next = startPct + (dx / total) * 100
-    splitPct.value = Math.max(0.5, Math.min(99.5, next))
+    splitPct.value = clampSplitPctForWidth(next, total)
   }
   function onUp() {
     window.removeEventListener('mousemove', onMove)
@@ -96,36 +125,50 @@ function onSplitMouseDown(ev) {
 
 const bothPanelsOpen = computed(() => !chatCollapsed.value && !previewCollapsed.value)
 
-const onlyChatVisible = computed(() => !chatCollapsed.value && previewCollapsed.value)
-
-const chatPanelStyle = computed(() => {
-  if (bothPanelsOpen.value) {
-    return { flex: `0 0 ${splitPct.value}%`, minWidth: 0, minHeight: 0 }
+const workspaceBodyGridStyle = computed(() => {
+  const g = GUTTER_W
+  if (chatCollapsed.value && previewCollapsed.value) {
+    return {
+      display: 'grid',
+      gridTemplateColumns: `${g}px`,
+      gridTemplateRows: 'minmax(0, 1fr)',
+    }
   }
-  if (!chatCollapsed.value) {
-    return { flex: '1 1 0%', flexBasis: 0, minWidth: 0, minHeight: 0, width: 'auto' }
+  if (chatCollapsed.value) {
+    return {
+      display: 'grid',
+      gridTemplateColumns: `${g}px minmax(0, 1fr)`,
+      gridTemplateRows: 'minmax(0, 1fr)',
+    }
   }
-  return {}
-})
-
-const previewPanelStyle = computed(() => {
-  if (bothPanelsOpen.value) {
-    return { flex: '1 1 0%', flexBasis: 0, minWidth: 0, minHeight: 0 }
+  if (previewCollapsed.value) {
+    return {
+      display: 'grid',
+      gridTemplateColumns: `minmax(0, 1fr) ${g}px`,
+      gridTemplateRows: 'minmax(0, 1fr)',
+    }
   }
-  if (!previewCollapsed.value) {
-    return { flex: '1 1 0%', flexBasis: 0, minWidth: 0, minHeight: 0, width: 'auto' }
+  const p = splitPct.value
+  return {
+    display: 'grid',
+    gridTemplateColumns: `minmax(0, ${p}%) ${g}px minmax(0, 1fr)`,
+    gridTemplateRows: 'minmax(0, 1fr)',
   }
-  return {}
 })
 
 function finishPanelLayout() {
   nextTick(() => {
-    const root = workspaceBodyEl.value
-    if (root && !chatCollapsed.value && !previewCollapsed.value) {
-      const w = root.getBoundingClientRect().width
-      if (w > 0) splitPct.value = clampSplitPctForWidth(splitPct.value, w)
-    }
-    persistSplitPct()
+    requestAnimationFrame(() => {
+      const root = workspaceBodyEl.value
+      if (root && !chatCollapsed.value && !previewCollapsed.value) {
+        let w = root.getBoundingClientRect().width
+        if (w <= 0) {
+          w = Math.max(360, window.innerWidth - 280)
+        }
+        splitPct.value = clampSplitPctForWidth(splitPct.value, w)
+      }
+      persistSplitPct()
+    })
   })
 }
 
@@ -224,6 +267,13 @@ function connectPreview(id) {
         previewTabReady.value = false
         viewportWidth.value = 0
         viewportHeight.value = 0
+        return
+      }
+      if (msg.state === 'ping') {
+        if (!imgSrc.value) {
+          previewPlaceholder.value = true
+          previewTabReady.value = false
+        }
         return
       }
       if (msg.state === 'tab_opened') {
@@ -325,7 +375,6 @@ async function loadSessions() {
 async function createSession() {
   if (creatingSession.value) return
   creatingSession.value = true
-  sendError.value = ''
   try {
     const body = { max_steps: Number(newMaxSteps.value) || 40 }
     const n = newSessionName.value.trim()
@@ -343,15 +392,20 @@ async function createSession() {
     connectSessionWs(j.session_id)
     await loadSessions()
   } catch (e) {
-    sendError.value = e.message || String(e)
+    showAppToast(e.message || String(e))
   } finally {
     creatingSession.value = false
   }
 }
 
 async function openSession(id) {
-  if (sessionId.value === id) return
-  sendError.value = ''
+  if (sessionId.value === id) {
+    chatCollapsed.value = false
+    previewCollapsed.value = false
+    finishPanelLayout()
+    connectPreview(id)
+    return
+  }
   disconnectSessionWs()
   sessionId.value = id
   try {
@@ -368,7 +422,7 @@ async function openSession(id) {
   } catch (e) {
     messages.value = []
     runStatus.value = ''
-    sendError.value = e.message || String(e)
+    showAppToast(e.message || String(e))
   }
   connectSessionWs(id)
 }
@@ -376,11 +430,10 @@ async function openSession(id) {
 async function deleteSession(id) {
   if (deletingSessionId.value) return
   deletingSessionId.value = id
-  sendError.value = ''
   try {
     const r = await fetch(`/api/sessions/${id}`, { method: 'DELETE' })
     if (r.status === 409) {
-      sendError.value = 'Wait for the agent to finish before deleting this session.'
+      showAppToast('Wait for the agent to finish before deleting this session.')
       return
     }
     if (!r.ok) throw new Error((await r.text()) || r.statusText)
@@ -392,7 +445,7 @@ async function deleteSession(id) {
     }
     await loadSessions()
   } catch (e) {
-    sendError.value = e.message || String(e)
+    showAppToast(e.message || String(e))
   } finally {
     deletingSessionId.value = null
   }
@@ -400,29 +453,80 @@ async function deleteSession(id) {
 
 const agentBusy = computed(() => runStatus.value === 'running')
 
-async function sendMessage() {
-  const text = draft.value.trim()
-  if (!text || !sessionId.value || sending.value || agentBusy.value) return
+async function loadSkills() {
+  loadingSkills.value = true
+  try {
+    const r = await fetch('/api/skills')
+    if (!r.ok) throw new Error((await r.text()) || r.statusText)
+    skillsList.value = await r.json()
+  } catch (e) {
+    skillsList.value = []
+    showAppToast(e.message || String(e))
+  } finally {
+    loadingSkills.value = false
+  }
+}
+
+async function openSkillDetail(id) {
+  skillPanelId.value = id
+  loadingSkillDetail.value = true
+  skillDetail.value = null
+  try {
+    const r = await fetch(`/api/skills/${encodeURIComponent(id)}`)
+    if (!r.ok) throw new Error((await r.text()) || r.statusText)
+    skillDetail.value = await r.json()
+  } catch (e) {
+    showAppToast(e.message || String(e))
+  } finally {
+    loadingSkillDetail.value = false
+  }
+}
+
+async function postUserMessage(text) {
+  const t = String(text || '').trim()
+  if (!t || !sessionId.value || sending.value || agentBusy.value) return false
   sending.value = true
-  sendError.value = ''
   try {
     const r = await fetch(`/api/sessions/${sessionId.value}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text: t }),
     })
     if (r.status === 409) {
-      sendError.value = 'Agent is still working on the previous message.'
-      return
+      showAppToast('Agent is still working on the previous message.')
+      return false
     }
     if (!r.ok) throw new Error((await r.text()) || r.statusText)
     const j = await r.json()
     runStatus.value = j.status || 'running'
-    draft.value = ''
+    return true
   } catch (e) {
-    sendError.value = e.message || String(e)
+    showAppToast(e.message || String(e))
+    return false
   } finally {
     sending.value = false
+  }
+}
+
+async function sendMessage() {
+  const text = draft.value.trim()
+  if (!text) return
+  if (await postUserMessage(text)) draft.value = ''
+}
+
+async function onComposerSkillSelect() {
+  const id = composerSkillId.value
+  if (!id) return
+  try {
+    const r = await fetch(`/api/skills/${encodeURIComponent(id)}`)
+    if (!r.ok) throw new Error((await r.text()) || r.statusText)
+    const j = await r.json()
+    const body = j.body != null ? String(j.body) : ''
+    if (body.trim()) await postUserMessage(body)
+  } catch (e) {
+    showAppToast(e.message || String(e))
+  } finally {
+    composerSkillId.value = ''
   }
 }
 
@@ -451,9 +555,19 @@ async function scrollLog() {
 
 watch(messages, scrollLog, { deep: true })
 
+watch(mainView, (v) => {
+  if (v === 'skills') loadSkills()
+  if (v === 'workspace') finishPanelLayout()
+})
+
 watch(
   sessionId,
   (id) => {
+    if (id) {
+      chatCollapsed.value = false
+      previewCollapsed.value = false
+      finishPanelLayout()
+    }
     connectPreview(id || null)
   },
   { flush: 'sync' },
@@ -574,13 +688,9 @@ async function applyViewportPreset(saveLs) {
 onMounted(() => {
   connectPreview()
   loadSessions()
+  loadSkills()
   loadViewportOptions()
-  nextTick(() => {
-    const root = workspaceBodyEl.value
-    if (!root || chatCollapsed.value || previewCollapsed.value) return
-    const w = root.getBoundingClientRect().width
-    if (w > 0) splitPct.value = clampSplitPctForWidth(splitPct.value, w)
-  })
+  finishPanelLayout()
 })
 onUnmounted(() => {
   if (previewMoveRaf != null) cancelAnimationFrame(previewMoveRaf)
@@ -591,7 +701,43 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="vh-100 d-flex flex-column min-h-0 overflow-hidden p-2">
+  <div class="vh-100 d-flex flex-column min-h-0 min-w-0 overflow-hidden p-2">
+    <nav
+      class="app-top-nav d-flex align-items-center gap-1 flex-shrink-0 border-bottom border-secondary-subtle pb-2 mb-1"
+      aria-label="Main navigation"
+    >
+      <button
+        type="button"
+        class="btn btn-sm"
+        :class="mainView === 'workspace' ? 'btn-secondary' : 'btn-outline-secondary'"
+        title="Workspace"
+        aria-label="Workspace"
+        @click="mainView = 'workspace'"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+          <path
+            d="M8.354 1.146a.5.5 0 0 0-.708 0l-6 6A.5.5 0 0 0 1.5 7.5v7a.5.5 0 0 0 .5.5h4.5a.5.5 0 0 0 .5-.5v-4h2v4a.5.5 0 0 0 .5.5H14a.5.5 0 0 0 .5-.5v-7a.5.5 0 0 0-.146-.354l-6-6zM2.5 7.707V14H1V7.5l5-5 5 5V14H9.5V7.707l-3-3-3 3z"
+          />
+        </svg>
+      </button>
+      <button
+        type="button"
+        class="btn btn-sm"
+        :class="mainView === 'skills' ? 'btn-secondary' : 'btn-outline-secondary'"
+        title="Skills"
+        aria-label="Skills"
+        @click="mainView = 'skills'"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+          <path
+            d="M1 2.828c.885-.37 2.154-.769 3.082-1.281C4.915 1.509 5.292 1 6 1h4c.708 0 1.085.509 1.918 1.546.928.512 2.197.911 3.082 1.28l.179.184A1 1 0 0 1 14 4.5V6a1 1 0 0 1-.485.832l-.179.085c-.885.37-2.154.769-3.082 1.281C9.085 7.491 8.708 8 8 8H4c-.708 0-1.085-.509-1.918-1.546-.928-.512-2.197-.911-3.082-1.28l-.179-.184A1 1 0 0 1 2 6V4.5a1 1 0 0 1 .485-.832l.179-.085zM4 2h4c.707 0 1.087.491 1.918 1.546.374.382.868.75 1.4 1.122l.544.338V6H2v-.282l.544-.338c.532-.372 1.026-.74 1.4-1.122C5.913 2.491 6.293 2 7 2H4z"
+          />
+          <path
+            d="M2 7v4.5A1.5 1.5 0 0 0 3.5 13h9a1.5 1.5 0 0 0 1.5-1.5V7H2zm11 4.5a.5.5 0 0 1-.5.5h-9a.5.5 0 0 1-.5-.5V8h10v3.5z"
+          />
+        </svg>
+      </button>
+    </nav>
     <div class="d-flex flex-row flex-nowrap flex-grow-1 min-h-0 min-w-0 gap-2">
       <aside class="border-end pe-2 d-flex flex-column min-h-0 flex-shrink-0" style="width: 220px; min-width: 200px">
         <div class="small text-muted mb-2 fw-semibold">Sessions</div>
@@ -671,29 +817,28 @@ onUnmounted(() => {
       </aside>
 
       <div class="d-flex flex-column flex-grow-1 min-w-0 min-h-0">
-        <div class="d-flex align-items-center justify-content-end mb-1 flex-wrap gap-2 flex-shrink-0">
-          <span v-if="runStatus" class="badge text-bg-secondary text-capitalize">{{ runStatus }}</span>
-        </div>
+        <template v-if="mainView === 'workspace'">
+          <div class="d-flex align-items-center justify-content-end mb-1 flex-wrap gap-2 flex-shrink-0">
+            <span v-if="runStatus" class="badge text-bg-secondary text-capitalize">{{ runStatus }}</span>
+          </div>
 
-        <div
-          ref="workspaceBodyEl"
-          class="d-flex flex-row flex-grow-1 align-items-stretch min-h-0 min-w-0 overflow-hidden"
-        >
+          <div
+            ref="workspaceBodyEl"
+            class="workspace-body-grid flex-grow-1 min-h-0 min-w-0 overflow-hidden"
+            :style="workspaceBodyGridStyle"
+          >
           <div
             v-if="!chatCollapsed"
-            class="d-flex flex-column min-h-0 min-w-0 overflow-hidden"
-            :class="{ 'flex-grow-1': onlyChatVisible }"
-            :style="chatPanelStyle"
+            class="workspace-chat d-flex flex-column min-h-0 min-w-0 overflow-hidden"
           >
             <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2 flex-shrink-0">
               <h1 class="h5 mb-0">Chat</h1>
             </div>
             <p v-if="sessionId" class="small text-muted mb-2 font-monospace text-truncate flex-shrink-0">session: {{ sessionId }}</p>
             <p v-else class="small text-muted flex-shrink-0">Create a chat or pick one from the list.</p>
-            <div v-if="sendError" class="alert alert-warning py-1 px-2 small mb-2 flex-shrink-0">{{ sendError }}</div>
             <div
               ref="logEl"
-              class="chat-messages-scroll mb-2 border rounded-2 bg-body-secondary p-2"
+              class="chat-messages-scroll min-w-0 mb-2 border rounded-2 bg-body-secondary p-2"
             >
               <div v-if="!messages.length" class="text-secondary small">No messages yet. Type below and send.</div>
               <div
@@ -721,8 +866,25 @@ onUnmounted(() => {
               </div>
             </div>
             <div class="border rounded p-2 bg-body-tertiary flex-shrink-0">
-              <label class="form-label small text-muted mb-1">Message</label>
+              <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-1">
+                <label class="form-label small text-muted mb-0" for="composer-message">Message</label>
+                <div class="d-flex align-items-center gap-1">
+                  <label class="form-label small text-muted mb-0 text-nowrap" for="composer-skill">Run skill</label>
+                  <select
+                    id="composer-skill"
+                    v-model="composerSkillId"
+                    class="form-select form-select-sm"
+                    style="width: auto; min-width: 9rem; max-width: 14rem"
+                    :disabled="!sessionId || sending || agentBusy"
+                    @change="onComposerSkillSelect"
+                  >
+                    <option value="">None</option>
+                    <option v-for="s in skillsList" :key="s.id" :value="s.id">{{ s.name }}</option>
+                  </select>
+                </div>
+              </div>
               <textarea
+                id="composer-message"
                 v-model="draft"
                 class="form-control form-control-sm"
                 rows="3"
@@ -781,8 +943,7 @@ onUnmounted(() => {
 
           <div
             v-if="!previewCollapsed"
-            class="d-flex flex-column min-h-0 min-w-0 overflow-hidden flex-grow-1"
-            :style="previewPanelStyle"
+            class="workspace-preview d-flex flex-column min-h-0 min-w-0 overflow-hidden"
           >
             <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2 flex-shrink-0">
               <h2 class="h5 mb-0">Browser preview</h2>
@@ -852,16 +1013,103 @@ onUnmounted(() => {
             </p>
           </div>
         </div>
+        </template>
+
+        <div
+          v-else
+          class="skills-panel d-flex flex-column flex-grow-1 min-h-0 min-w-0 overflow-hidden"
+        >
+          <h1 class="h5 mb-2 flex-shrink-0">Skills</h1>
+          <div class="row flex-grow-1 min-h-0 g-2 g-md-3">
+            <div class="col-12 col-md-4 min-h-0 d-flex flex-column">
+              <div v-if="loadingSkills" class="small text-muted">Loading...</div>
+              <div
+                v-else
+                class="list-group list-group-flush small overflow-auto flex-grow-1 min-h-0 border rounded"
+              >
+                <button
+                  v-for="s in skillsList"
+                  :key="s.id"
+                  type="button"
+                  class="list-group-item list-group-item-action text-start"
+                  :class="{ active: skillPanelId === s.id }"
+                  @click="openSkillDetail(s.id)"
+                >
+                  <div class="fw-semibold">{{ s.name }}</div>
+                  <div v-if="s.description" class="text-muted small text-wrap">{{ s.description }}</div>
+                </button>
+                <div v-if="!skillsList.length" class="p-2 text-muted small">
+                  No skills. Add folders under _skills with SKILL.md.
+                </div>
+              </div>
+            </div>
+            <div class="col-12 col-md-8 min-h-0 d-flex flex-column">
+              <div v-if="loadingSkillDetail" class="small text-muted">Loading...</div>
+              <div v-else-if="skillDetail" class="d-flex flex-column flex-grow-1 min-h-0 overflow-hidden">
+                <div class="fw-semibold mb-1 flex-shrink-0">{{ skillDetail.name }}</div>
+                <div v-if="skillDetail.description" class="small text-muted mb-2 flex-shrink-0">
+                  {{ skillDetail.description }}
+                </div>
+                <div
+                  class="session-md flex-grow-1 min-h-0 overflow-auto border rounded-2 bg-body-secondary p-2"
+                  v-html="renderMd(skillDetail.body)"
+                />
+              </div>
+              <p v-else class="text-muted small mb-0">Select a skill from the list.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="toast-container position-fixed top-0 end-0 p-2 app-toast-stack">
+      <div
+        v-for="t in toastItems"
+        :id="`app-toast-${t.id}`"
+        :key="t.id"
+        class="toast align-items-center border-0"
+        :class="`text-bg-${t.variant || 'warning'}`"
+        role="alert"
+        aria-live="assertive"
+        aria-atomic="true"
+      >
+        <div class="d-flex">
+          <div class="toast-body small">{{ t.message }}</div>
+          <button
+            type="button"
+            class="btn-close btn-close-white me-2 m-auto"
+            data-bs-dismiss="toast"
+            aria-label="Close"
+          />
+        </div>
       </div>
     </div>
   </div>
 </template>
 
 <style scoped>
+.workspace-body-grid {
+  align-content: stretch;
+  box-sizing: border-box;
+}
+.workspace-chat,
+.workspace-preview {
+  min-width: 0;
+}
 .chat-messages-scroll {
+  min-width: 0;
+  max-width: 100%;
   max-height: min(65vh, calc(100vh - 220px));
   overflow-x: hidden;
   overflow-y: auto;
+}
+.session-md :deep(img) {
+  max-width: 100%;
+  height: auto;
+}
+.session-md :deep(table) {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
 }
 .split-gutter-wrap {
   position: relative;
@@ -981,6 +1229,7 @@ onUnmounted(() => {
   margin-bottom: 0;
 }
 .session-md :deep(pre) {
+  max-width: 100%;
   padding: 0.5rem;
   background: var(--bs-tertiary-bg);
   border-radius: 0.25rem;
@@ -990,5 +1239,8 @@ onUnmounted(() => {
   padding: 0.1rem 0.25rem;
   background: var(--bs-tertiary-bg);
   border-radius: 0.2rem;
+}
+.app-toast-stack {
+  z-index: 1080;
 }
 </style>

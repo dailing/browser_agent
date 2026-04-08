@@ -6,6 +6,7 @@
     "temperature": 0.2
   },
   "browser": {
+    "session_tab_idle_sec": 600,
     "default_viewport_preset_id": "1280x720",
     "viewport_presets": [
       { "id": "1280x720", "label": "Landscape 1280x720", "width": 1280, "height": 720 },

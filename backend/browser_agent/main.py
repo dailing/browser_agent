@@ -18,6 +18,7 @@ from browser_agent.preview_publisher import PreviewPublisher
 from browser_agent.run_coordinator import RunCoordinator
 from browser_agent.session_fanout import SessionFanout
 from browser_agent.session_store import DbSessionStore
+from browser_agent.skills_store import list_skills as scan_skills, load_skill
 from browser_agent.viewport_presets import (
     initial_viewport_from_presets,
     load_viewport_config,
@@ -27,12 +28,47 @@ START_URL = os.environ.get("BROWSER_AGENT_START_URL", "https://example.com")
 HOST = os.environ.get("BROWSER_AGENT_HOST", "127.0.0.1")
 PORT = int(os.environ.get("BROWSER_AGENT_PORT", "18000"))
 PREVIEW_MS = int(os.environ.get("BROWSER_AGENT_PREVIEW_MS", "500"))
-SESSION_TAB_IDLE_SEC = float(os.environ.get("BROWSER_AGENT_SESSION_TAB_IDLE_SEC", "21600"))
 
 os.environ.setdefault("PDF_READER_API_BASE", "http://server.tail13fe1.ts.net:10000")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _STATIC_DIR = _REPO_ROOT / "frontend" / "dist"
+_SKILLS_DIR = _REPO_ROOT / "_skills"
+
+
+def _config_path(repo_root: Path) -> Path:
+    override = os.environ.get("BROWSER_AGENT_CONFIG")
+    if override:
+        return Path(override).expanduser().resolve()
+    return repo_root / "config.json"
+
+
+def _read_json_object(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"Invalid JSON in {path}: {e.msg} (line {e.lineno}, column {e.colno}). "
+            "Use strict JSON: double-quoted keys, no trailing commas, no // comments."
+        ) from e
+    return data if isinstance(data, dict) else {}
+
+
+def _resolve_session_tab_idle_sec(repo_root: Path) -> float:
+    default_sec = 600.0
+    data = _read_json_object(_config_path(repo_root))
+    browser = data.get("browser")
+    if not isinstance(browser, dict):
+        return default_sec
+    raw = browser.get("session_tab_idle_sec")
+    try:
+        sec = float(raw)
+    except (TypeError, ValueError):
+        return default_sec
+    return sec if sec > 0 else default_sec
 
 
 class HttpOnlyStaticFiles(StaticFiles):
@@ -134,8 +170,9 @@ async def lifespan(app: FastAPI):
     _viewport_presets = list(presets)
     _preset_by_id = {str(p["id"]): p for p in _viewport_presets}
     initial_vp = initial_viewport_from_presets(_viewport_presets, default_vp_id)
+    tab_idle_sec = _resolve_session_tab_idle_sec(_REPO_ROOT)
     _browser = BrowserManager(
-        START_URL, viewport=initial_vp, tab_idle_timeout_sec=SESSION_TAB_IDLE_SEC
+        START_URL, viewport=initial_vp, tab_idle_timeout_sec=tab_idle_sec
     )
     await _browser.start()
 
@@ -173,6 +210,19 @@ app = FastAPI(title="browser-agent", lifespan=lifespan)
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+
+@app.get("/api/skills")
+async def api_list_skills():
+    return scan_skills(_SKILLS_DIR)
+
+
+@app.get("/api/skills/{skill_id}")
+async def api_get_skill(skill_id: str):
+    data = load_skill(_SKILLS_DIR, skill_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return data
 
 
 @app.post("/api/sessions")
