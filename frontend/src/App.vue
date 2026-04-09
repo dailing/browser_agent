@@ -1,9 +1,21 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import MarkdownIt from 'markdown-it'
+import mermaid from 'mermaid'
 import { Toast } from 'bootstrap'
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
+const origFence = md.renderer.rules.fence
+md.renderer.rules.fence = (tokens, idx, options, env, self) => {
+  const token = tokens[idx]
+  const info = String(token.info || '')
+    .trim()
+    .split(/\s+/)[0]
+  if (info === 'mermaid') {
+    return `<div class="mermaid">${md.utils.escapeHtml(token.content)}</div>\n`
+  }
+  return origFence ? origFence(tokens, idx, options, env, self) : self.renderToken(tokens, idx, options)
+}
 
 const sessions = ref([])
 const loadingSessions = ref(false)
@@ -19,6 +31,7 @@ const draft = ref('')
 const sending = ref(false)
 
 const logEl = ref(null)
+const analysisLogEl = ref(null)
 const imgSrc = ref('')
 const previewPlaceholder = ref(false)
 const previewTabReady = ref(false)
@@ -39,6 +52,9 @@ const skillPanelId = ref(null)
 const skillDetail = ref(null)
 const loadingSkillDetail = ref(false)
 const composerSkillId = ref('')
+
+const analysisResult = ref('')
+const analysisBusy = ref(false)
 
 const MIN_CHAT_W = 220
 const MIN_PREVIEW_W = 200
@@ -530,6 +546,33 @@ async function onComposerSkillSelect() {
   }
 }
 
+async function runSessionAnalysis() {
+  if (!sessionId.value || analysisBusy.value) return
+  analysisBusy.value = true
+  try {
+    const r = await fetch(`/api/sessions/${sessionId.value}/session-analysis`, {
+      method: 'POST',
+    })
+    if (!r.ok) {
+      let detail = (await r.text()) || r.statusText
+      try {
+        const j = JSON.parse(detail)
+        if (typeof j.detail === 'string') detail = j.detail
+        else if (Array.isArray(j.detail)) detail = j.detail.map((x) => x.msg || x).join('; ')
+      } catch {
+        /* keep text */
+      }
+      throw new Error(detail)
+    }
+    const j = await r.json()
+    analysisResult.value = String(j.markdown || '')
+  } catch (e) {
+    showAppToast(e.message || String(e))
+  } finally {
+    analysisBusy.value = false
+  }
+}
+
 function onComposerKeydown(ev) {
   if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter') {
     ev.preventDefault()
@@ -540,6 +583,18 @@ function onComposerKeydown(ev) {
 function renderMd(text) {
   if (!text) return ''
   return md.render(text)
+}
+
+async function hydrateMermaid(container) {
+  await nextTick()
+  if (!container) return
+  const nodes = [...container.querySelectorAll('.mermaid')].filter((el) => !el.querySelector('svg'))
+  if (!nodes.length) return
+  try {
+    await mermaid.run({ nodes })
+  } catch {
+    /* invalid diagram source */
+  }
 }
 
 function formatToolCalls(tc) {
@@ -553,16 +608,31 @@ async function scrollLog() {
   if (el) el.scrollTop = el.scrollHeight
 }
 
-watch(messages, scrollLog, { deep: true })
+async function scrollAnalysisOutput() {
+  await nextTick()
+  const el = analysisLogEl.value
+  if (el) el.scrollTop = el.scrollHeight
+}
 
-watch(mainView, (v) => {
+watch(messages, scrollLog, { deep: true })
+watch(analysisResult, async () => {
+  await scrollAnalysisOutput()
+  if (mainView.value === 'session_analysis') await hydrateMermaid(analysisLogEl.value)
+})
+
+watch(mainView, async (v) => {
   if (v === 'skills') loadSkills()
-  if (v === 'workspace') finishPanelLayout()
+  if (v === 'workspace' || v === 'session_analysis') finishPanelLayout()
+  if (v === 'session_analysis') {
+    await scrollAnalysisOutput()
+    await hydrateMermaid(analysisLogEl.value)
+  }
 })
 
 watch(
   sessionId,
-  (id) => {
+  (id, prev) => {
+    if (id !== prev) analysisResult.value = ''
     if (id) {
       chatCollapsed.value = false
       previewCollapsed.value = false
@@ -686,6 +756,7 @@ async function applyViewportPreset(saveLs) {
 }
 
 onMounted(() => {
+  mermaid.initialize({ startOnLoad: false, securityLevel: 'strict' })
   connectPreview()
   loadSessions()
   loadSkills()
@@ -723,6 +794,24 @@ onUnmounted(() => {
       <button
         type="button"
         class="btn btn-sm"
+        :class="mainView === 'session_analysis' ? 'btn-secondary' : 'btn-outline-secondary'"
+        title="Session analysis"
+        aria-label="Session analysis"
+        @click="mainView = 'session_analysis'"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+          <path
+            fill-rule="evenodd"
+            d="M6 3.5A1.5 1.5 0 0 1 7.5 2h1A1.5 1.5 0 0 1 10 3.5v1A1.5 1.5 0 0 1 8.5 6v1H14a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-1 0V8h-5v.5a.5.5 0 0 1-1 0V8h-5v.5a.5.5 0 0 1-1 0v-1A.5.5 0 0 1 2 7h5.5V6A1.5 1.5 0 0 1 6 4.5zM6.5 4a.5.5 0 0 0-.5.5v1a.5.5 0 0 0 .5.5h1a.5.5 0 0 0 .5-.5v-1a.5.5 0 0 0-.5-.5z"
+          />
+          <path
+            d="M11 11a1.5 1.5 0 0 1 1.5-1.5h1A1.5 1.5 0 0 1 15 11v1a1.5 1.5 0 0 1-1.5 1.5h-1A1.5 1.5 0 0 1 11 12z"
+          />
+        </svg>
+      </button>
+      <button
+        type="button"
+        class="btn btn-sm"
         :class="mainView === 'skills' ? 'btn-secondary' : 'btn-outline-secondary'"
         title="Skills"
         aria-label="Skills"
@@ -738,7 +827,7 @@ onUnmounted(() => {
         </svg>
       </button>
     </nav>
-    <div class="d-flex flex-row flex-nowrap flex-grow-1 min-h-0 min-w-0 gap-2">
+    <div class="layout-fill d-flex flex-row flex-nowrap gap-2">
       <aside class="border-end pe-2 d-flex flex-column min-h-0 flex-shrink-0" style="width: 220px; min-width: 200px">
         <div class="small text-muted mb-2 fw-semibold">Sessions</div>
         <div class="mb-2">
@@ -816,211 +905,241 @@ onUnmounted(() => {
         </div>
       </aside>
 
-      <div class="d-flex flex-column flex-grow-1 min-w-0 min-h-0">
+      <div class="layout-fill d-flex flex-column overflow-hidden">
         <template v-if="mainView === 'workspace'">
-          <div class="d-flex align-items-center justify-content-end mb-1 flex-wrap gap-2 flex-shrink-0">
-            <span v-if="runStatus" class="badge text-bg-secondary text-capitalize">{{ runStatus }}</span>
+          <div v-if="runStatus" class="d-flex justify-content-end mb-1 flex-shrink-0">
+            <span class="badge text-bg-secondary text-capitalize">{{ runStatus }}</span>
           </div>
 
           <div
             ref="workspaceBodyEl"
-            class="workspace-body-grid flex-grow-1 min-h-0 min-w-0 overflow-hidden"
+            class="workspace-body-grid overflow-hidden"
             :style="workspaceBodyGridStyle"
           >
-          <div
-            v-if="!chatCollapsed"
-            class="workspace-chat d-flex flex-column min-h-0 min-w-0 overflow-hidden"
-          >
-            <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2 flex-shrink-0">
-              <h1 class="h5 mb-0">Chat</h1>
-            </div>
-            <p v-if="sessionId" class="small text-muted mb-2 font-monospace text-truncate flex-shrink-0">session: {{ sessionId }}</p>
-            <p v-else class="small text-muted flex-shrink-0">Create a chat or pick one from the list.</p>
-            <div
-              ref="logEl"
-              class="chat-messages-scroll min-w-0 mb-2 border rounded-2 bg-body-secondary p-2"
-            >
-              <div v-if="!messages.length" class="text-secondary small">No messages yet. Type below and send.</div>
+            <div v-if="!chatCollapsed" class="workspace-chat">
+              <h1 class="h5 mb-2 flex-shrink-0">Chat</h1>
+              <p v-if="sessionId" class="small text-muted mb-2 font-monospace text-truncate flex-shrink-0">session: {{ sessionId }}</p>
+              <p v-else class="small text-muted flex-shrink-0">Create a chat or pick one from the list.</p>
               <div
-                v-for="(m, i) in messages"
-                :key="`m-${i}-${m.role}-${m.content?.slice?.(0, 24)}`"
-                class="mb-3 pb-3 border-bottom border-secondary-subtle"
+                ref="logEl"
+                class="chat-messages-scroll mb-2 border rounded-2 bg-body-secondary p-2"
               >
-                <template v-if="m.role === 'user'">
-                  <div class="small text-info fw-semibold mb-1">User</div>
-                  <div class="session-md" v-html="renderMd(m.content)"></div>
-                </template>
-                <template v-else-if="m.role === 'assistant'">
-                  <div class="small text-success fw-semibold mb-1">Assistant</div>
-                  <div v-if="m.content" class="session-md" v-html="renderMd(m.content)"></div>
-                  <pre v-if="m.tool_calls?.length" class="small bg-dark text-light p-2 rounded mt-2 mb-0 overflow-x-auto">{{ formatToolCalls(m.tool_calls) }}</pre>
-                </template>
-                <template v-else-if="m.role === 'tool'">
-                  <div class="small text-warning fw-semibold mb-1">Tool result</div>
-                  <pre class="small bg-body-tertiary p-2 rounded mb-0 text-break overflow-auto" style="white-space: pre-wrap">{{ m.content }}</pre>
-                </template>
-                <template v-else>
-                  <div class="small text-muted mb-1">{{ m.role }}</div>
-                  <pre class="small mb-0">{{ JSON.stringify(m, null, 2) }}</pre>
-                </template>
-              </div>
-            </div>
-            <div class="border rounded p-2 bg-body-tertiary flex-shrink-0">
-              <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-1">
-                <label class="form-label small text-muted mb-0" for="composer-message">Message</label>
-                <div class="d-flex align-items-center gap-1">
-                  <label class="form-label small text-muted mb-0 text-nowrap" for="composer-skill">Run skill</label>
-                  <select
-                    id="composer-skill"
-                    v-model="composerSkillId"
-                    class="form-select form-select-sm"
-                    style="width: auto; min-width: 9rem; max-width: 14rem"
-                    :disabled="!sessionId || sending || agentBusy"
-                    @change="onComposerSkillSelect"
-                  >
-                    <option value="">None</option>
-                    <option v-for="s in skillsList" :key="s.id" :value="s.id">{{ s.name }}</option>
-                  </select>
+                <div v-if="!messages.length" class="text-secondary small">No messages yet. Type below and send.</div>
+                <div
+                  v-for="(m, i) in messages"
+                  :key="`m-${i}-${m.role}-${m.content?.slice?.(0, 24)}`"
+                  class="mb-3 pb-3 border-bottom border-secondary-subtle"
+                >
+                  <template v-if="m.role === 'user'">
+                    <div class="small text-info fw-semibold mb-1">User</div>
+                    <div class="session-md" v-html="renderMd(m.content)"></div>
+                  </template>
+                  <template v-else-if="m.role === 'assistant'">
+                    <div class="small text-success fw-semibold mb-1">Assistant</div>
+                    <div v-if="m.content" class="session-md" v-html="renderMd(m.content)"></div>
+                    <pre v-if="m.tool_calls?.length" class="small bg-dark text-light p-2 rounded mt-2 mb-0 overflow-x-auto">{{ formatToolCalls(m.tool_calls) }}</pre>
+                  </template>
+                  <template v-else-if="m.role === 'tool'">
+                    <div class="small text-warning fw-semibold mb-1">Tool result</div>
+                    <pre class="small bg-body-tertiary p-2 rounded mb-0 text-break overflow-auto" style="white-space: pre-wrap">{{ m.content }}</pre>
+                  </template>
+                  <template v-else>
+                    <div class="small text-muted mb-1">{{ m.role }}</div>
+                    <pre class="small mb-0">{{ JSON.stringify(m, null, 2) }}</pre>
+                  </template>
                 </div>
               </div>
-              <textarea
-                id="composer-message"
-                v-model="draft"
-                class="form-control form-control-sm"
-                rows="3"
-                placeholder="Message... (Ctrl+Enter or Cmd+Enter to send)"
-                :disabled="!sessionId || sending || agentBusy"
-                @keydown="onComposerKeydown"
+              <div class="border rounded p-2 bg-body-tertiary flex-shrink-0">
+                <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-1">
+                  <label class="form-label small text-muted mb-0" for="composer-message">Message</label>
+                  <div class="d-flex align-items-center gap-1">
+                    <label class="form-label small text-muted mb-0 text-nowrap" for="composer-skill">Run skill</label>
+                    <select
+                      id="composer-skill"
+                      v-model="composerSkillId"
+                      class="form-select form-select-sm"
+                      style="width: auto; min-width: 9rem; max-width: 14rem"
+                      :disabled="!sessionId || sending || agentBusy"
+                      @change="onComposerSkillSelect"
+                    >
+                      <option value="">None</option>
+                      <option v-for="s in skillsList" :key="s.id" :value="s.id">{{ s.name }}</option>
+                    </select>
+                  </div>
+                </div>
+                <textarea
+                  id="composer-message"
+                  v-model="draft"
+                  class="form-control form-control-sm"
+                  rows="3"
+                  placeholder="Message... (Ctrl+Enter or Cmd+Enter to send)"
+                  :disabled="!sessionId || sending || agentBusy"
+                  @keydown="onComposerKeydown"
+                />
+                <div class="d-flex justify-content-between align-items-center mt-2">
+                  <span class="small text-muted">Agent run is serialized per session while status is running.</span>
+                  <button type="button" class="btn btn-primary btn-sm" :disabled="!sessionId || !draft.trim() || sending || agentBusy" @click="sendMessage">
+                    {{ sending ? 'Sending...' : agentBusy ? 'Agent busy...' : 'Send' }}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div
+              class="split-gutter-wrap flex-shrink-0"
+              :title="bothPanelsOpen ? 'Drag to resize chat and preview' : ''"
+            >
+              <div
+                class="split-gutter-drag"
+                :class="{ 'split-gutter-drag-disabled': !bothPanelsOpen }"
+                @mousedown="onSplitDragMouseDown"
               />
-              <div class="d-flex justify-content-between align-items-center mt-2">
-                <span class="small text-muted">Agent run is serialized per session while status is running.</span>
-                <button type="button" class="btn btn-primary btn-sm" :disabled="!sessionId || !draft.trim() || sending || agentBusy" @click="sendMessage">
-                  {{ sending ? 'Sending...' : agentBusy ? 'Agent busy...' : 'Send' }}
+              <div class="split-gutter-fabs">
+                <button
+                  type="button"
+                  class="gutter-fab"
+                  :class="{ 'gutter-fab-off': chatCollapsed }"
+                  :title="chatCollapsed ? 'Show chat' : 'Hide chat'"
+                  aria-label="Toggle chat panel"
+                  @click.stop="toggleChatPanel"
+                >
+                  <svg class="gutter-fab-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                    <path
+                      d="M14 1a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4.414A2 2 0 0 0 3 11.586l-2 2V2a1 1 0 0 1 1-1h12zM2 0a2 2 0 0 0-2 2v12.793a.5.5 0 0 0 .854.353l2.853-2.853A1 1 0 0 1 4.414 12H14a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2H2z"
+                    />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  class="gutter-fab"
+                  :class="{ 'gutter-fab-off': previewCollapsed }"
+                  :title="previewCollapsed ? 'Show preview' : 'Hide preview'"
+                  aria-label="Toggle browser preview panel"
+                  @click.stop="togglePreviewPanel"
+                >
+                  <svg class="gutter-fab-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                    <path d="M0 4s0-2 2-2h12s2 0 2 2v6s0 2-2 2H2s-2 0-2-2V4zm1.398-.855a.758.758 0 0 0-.254.302A1.46 1.46 0 0 0 1 4.01V10c0 .325.078.502.145.602.07.105.17.188.365.221.296.05.685-.06 1.09-.218C4.09 9.582 6.195 9 8 9s3.91.582 4.91.865c.405.157.794.267 1.09.22.195-.033.295-.116.365-.221.068-.1.145-.277.145-.602V4.009c0-.124-.019-.245-.055-.352a.76.76 0 0 0-.254-.302C13.925 2.887 11.085 2 8 2c-3.086 0-5.925.887-7.602 1.145z" />
+                    <path d="M8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5zM4.5 8a3.5 3.5 0 1 1 7 0 3.5 3.5 0 0 1-7 0z" />
+                  </svg>
                 </button>
               </div>
             </div>
-          </div>
 
-          <div
-            class="split-gutter-wrap flex-shrink-0"
-            :title="bothPanelsOpen ? 'Drag to resize chat and preview' : ''"
-          >
-            <div
-              class="split-gutter-drag"
-              :class="{ 'split-gutter-drag-disabled': !bothPanelsOpen }"
-              @mousedown="onSplitDragMouseDown"
-            />
-            <div class="split-gutter-fabs">
-              <button
-                type="button"
-                class="gutter-fab"
-                :class="{ 'gutter-fab-off': chatCollapsed }"
-                :title="chatCollapsed ? 'Show chat' : 'Hide chat'"
-                aria-label="Toggle chat panel"
-                @click.stop="toggleChatPanel"
-              >
-                <svg class="gutter-fab-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                  <path
-                    d="M14 1a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4.414A2 2 0 0 0 3 11.586l-2 2V2a1 1 0 0 1 1-1h12zM2 0a2 2 0 0 0-2 2v12.793a.5.5 0 0 0 .854.353l2.853-2.853A1 1 0 0 1 4.414 12H14a2 2 0 0 0 2-2V2a2 2 0 0 0-2-2H2z"
-                  />
-                </svg>
-              </button>
-              <button
-                type="button"
-                class="gutter-fab"
-                :class="{ 'gutter-fab-off': previewCollapsed }"
-                :title="previewCollapsed ? 'Show preview' : 'Hide preview'"
-                aria-label="Toggle browser preview panel"
-                @click.stop="togglePreviewPanel"
-              >
-                <svg class="gutter-fab-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                  <path d="M0 4s0-2 2-2h12s2 0 2 2v6s0 2-2 2H2s-2 0-2-2V4zm1.398-.855a.758.758 0 0 0-.254.302A1.46 1.46 0 0 0 1 4.01V10c0 .325.078.502.145.602.07.105.17.188.365.221.296.05.685-.06 1.09-.218C4.09 9.582 6.195 9 8 9s3.91.582 4.91.865c.405.157.794.267 1.09.22.195-.033.295-.116.365-.221.068-.1.145-.277.145-.602V4.009c0-.124-.019-.245-.055-.352a.76.76 0 0 0-.254-.302C13.925 2.887 11.085 2 8 2c-3.086 0-5.925.887-7.602 1.145z" />
-                  <path d="M8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5zM4.5 8a3.5 3.5 0 1 1 7 0 3.5 3.5 0 0 1-7 0z" />
-                </svg>
-              </button>
-            </div>
-          </div>
-
-          <div
-            v-if="!previewCollapsed"
-            class="workspace-preview d-flex flex-column min-h-0 min-w-0 overflow-hidden"
-          >
-            <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2 flex-shrink-0">
-              <h2 class="h5 mb-0">Browser preview</h2>
-              <div class="d-flex align-items-center gap-2 flex-wrap justify-content-end">
-                <select
-                  v-if="viewportPresets.length"
-                  v-model="viewportPresetId"
-                  class="form-select form-select-sm"
-                  style="width: auto; min-width: 11rem; max-width: 16rem"
-                  title="Browser viewport size"
-                  :disabled="viewportApplyBusy"
-                  @change="onViewportPresetChange"
-                >
-                  <option v-for="p in viewportPresets" :key="p.id" :value="p.id">{{ p.label }}</option>
-                </select>
-                <div v-if="imgSrc && viewportWidth" class="form-check form-switch m-0">
-                  <input
-                    id="remote-mouse"
-                    v-model="remoteMouseEnabled"
-                    class="form-check-input"
-                    type="checkbox"
-                    role="switch"
-                    :disabled="previewStatus !== 'live'"
-                  />
-                  <label class="form-check-label small" for="remote-mouse">Remote mouse</label>
+            <div v-if="!previewCollapsed" class="workspace-preview">
+              <header class="preview-toolbar">
+                <h2 class="h5 mb-0">Browser preview</h2>
+                <div class="preview-toolbar-end">
+                  <select
+                    v-if="viewportPresets.length"
+                    v-model="viewportPresetId"
+                    class="form-select form-select-sm"
+                    style="width: auto; min-width: 11rem; max-width: 16rem"
+                    title="Browser viewport size"
+                    :disabled="viewportApplyBusy"
+                    @change="onViewportPresetChange"
+                  >
+                    <option v-for="p in viewportPresets" :key="p.id" :value="p.id">{{ p.label }}</option>
+                  </select>
+                  <div v-if="imgSrc && viewportWidth" class="form-check form-switch m-0">
+                    <input
+                      id="remote-mouse"
+                      v-model="remoteMouseEnabled"
+                      class="form-check-input"
+                      type="checkbox"
+                      role="switch"
+                      :disabled="previewStatus !== 'live'"
+                    />
+                    <label class="form-check-label small" for="remote-mouse">Remote mouse</label>
+                  </div>
+                  <span class="badge text-bg-secondary text-capitalize">{{ previewStatus }}</span>
                 </div>
-                <span class="badge text-bg-secondary text-capitalize">{{ previewStatus }}</span>
+              </header>
+              <div
+                id="preview-scroll-area"
+                tabindex="0"
+                class="preview-viewport border rounded-2 bg-dark p-2 d-flex align-items-center justify-content-center w-100"
+              >
+                <div v-if="imgSrc" class="position-relative d-inline-block">
+                  <img
+                    :src="imgSrc"
+                    alt="viewport"
+                    class="img-fluid d-block"
+                    style="max-width: 100%; height: auto; user-select: none; pointer-events: none"
+                  />
+                  <div
+                    v-show="remoteMouseEnabled && viewportWidth"
+                    class="position-absolute top-0 start-0 end-0 bottom-0 remote-mouse-overlay"
+                    style="touch-action: none; cursor: crosshair"
+                    @pointerdown.prevent="onRemotePointerDown"
+                    @pointerup.prevent="onRemotePointerUp"
+                    @pointermove.prevent="onRemotePointerMove"
+                  />
+                </div>
+                <div v-else-if="previewPlaceholder" class="text-secondary py-5 px-3 text-center">
+                  <p class="mb-2 fw-semibold">No live browser tab yet</p>
+                  <p class="small mb-0 text-muted">
+                    Preview stays connected to this session. A tab opens when the agent runs a browser action; then video
+                    starts automatically.
+                  </p>
+                </div>
+                <p v-else-if="previewTabReady" class="text-secondary mb-0 py-5 text-center">Tab opened — loading preview…</p>
+                <p v-else-if="previewStatus === 'no_session'" class="text-secondary mb-0 py-5 text-center">Select a session for preview.</p>
+                <p v-else class="text-secondary mb-0 py-5 text-center">Connecting…</p>
               </div>
+              <p class="text-muted small mt-2 mb-0 flex-shrink-0 preview-footnote">
+                <template v-if="imgSrc && remoteMouseEnabled">Mouse on the image is sent to this session's tab.</template>
+                <template v-else-if="imgSrc">Read-only preview unless Remote mouse is on.</template>
+                <template v-else-if="sessionId">Preview WebSocket is per session; frames stream once a tab exists.</template>
+                <template v-else>Pick a session to attach preview.</template>
+              </p>
             </div>
-            <div
-              id="preview-scroll-area"
-              tabindex="0"
-              class="border rounded-2 overflow-auto bg-dark p-2 flex-grow-1 d-flex align-items-center justify-content-center min-h-0 w-100"
-            >
-              <div v-if="imgSrc" class="position-relative d-inline-block">
-                <img
-                  :src="imgSrc"
-                  alt="viewport"
-                  class="img-fluid d-block"
-                  style="max-width: 100%; height: auto; user-select: none; pointer-events: none"
-                />
-                <div
-                  v-show="remoteMouseEnabled && viewportWidth"
-                  class="position-absolute top-0 start-0 end-0 bottom-0 remote-mouse-overlay"
-                  style="touch-action: none; cursor: crosshair"
-                  @pointerdown.prevent="onRemotePointerDown"
-                  @pointerup.prevent="onRemotePointerUp"
-                  @pointermove.prevent="onRemotePointerMove"
-                />
-              </div>
-              <div v-else-if="previewPlaceholder" class="text-secondary py-5 px-3 text-center">
-                <p class="mb-2 fw-semibold">No live browser tab yet</p>
-                <p class="small mb-0 text-muted">
-                  Preview stays connected to this session. A tab opens when the agent runs a browser action; then video
-                  starts automatically.
-                </p>
-              </div>
-              <p v-else-if="previewTabReady" class="text-secondary mb-0 py-5 text-center">Tab opened — loading preview…</p>
-              <p v-else-if="previewStatus === 'no_session'" class="text-secondary mb-0 py-5 text-center">Select a session for preview.</p>
-              <p v-else class="text-secondary mb-0 py-5 text-center">Connecting…</p>
-            </div>
-            <p class="text-muted small mt-2 mb-0 flex-shrink-0 preview-footnote">
-              <template v-if="imgSrc && remoteMouseEnabled">Mouse on the image is sent to this session's tab.</template>
-              <template v-else-if="imgSrc">Read-only preview unless Remote mouse is on.</template>
-              <template v-else-if="sessionId">Preview WebSocket is per session; frames stream once a tab exists.</template>
-              <template v-else>Pick a session to attach preview.</template>
-            </p>
           </div>
-        </div>
         </template>
 
         <div
+          v-else-if="mainView === 'session_analysis'"
+          class="session-analysis-page overflow-hidden d-flex flex-column"
+        >
+          <div v-if="runStatus" class="d-flex justify-content-end mb-1 flex-shrink-0">
+            <span class="badge text-bg-secondary text-capitalize">{{ runStatus }}</span>
+          </div>
+          <div class="session-analysis-body border rounded-2 bg-body-secondary overflow-hidden">
+            <div class="session-analysis-body-head px-2 pt-2 pb-0 flex-shrink-0">
+              <h2 class="h5 mb-2">Analysis</h2>
+              <p v-if="sessionId" class="small text-muted mb-2 font-monospace text-truncate">session: {{ sessionId }}</p>
+              <p v-else class="small text-muted mb-2">Create a chat or pick one from the list.</p>
+            </div>
+            <div
+              ref="analysisLogEl"
+              class="session-analysis-scroll px-2 pb-2 border-top border-secondary-subtle"
+              tabindex="0"
+            >
+              <div v-if="analysisResult" class="session-md pt-2" v-html="renderMd(analysisResult)"></div>
+              <p v-else-if="analysisBusy" class="small text-muted mb-0 pt-2">Analyzing…</p>
+              <p v-else-if="sessionId" class="small text-muted mb-0 pt-2">
+                Run analysis to show Markdown here. Diagrams: use a fenced mermaid code block.
+              </p>
+              <p v-else class="small text-muted mb-0 pt-2">Pick a session in the sidebar.</p>
+            </div>
+            <div class="session-analysis-footer border-top border-secondary-subtle p-2 bg-body-tertiary d-flex justify-content-end flex-shrink-0">
+              <button
+                type="button"
+                class="btn btn-primary btn-sm"
+                :disabled="!sessionId || analysisBusy"
+                @click="runSessionAnalysis"
+              >
+                {{ analysisBusy ? 'Analyzing…' : 'Analyze session' }}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div
           v-else
-          class="skills-panel d-flex flex-column flex-grow-1 min-h-0 min-w-0 overflow-hidden"
+          class="skills-panel d-flex flex-column overflow-hidden"
         >
           <h1 class="h5 mb-2 flex-shrink-0">Skills</h1>
-          <div class="row flex-grow-1 min-h-0 g-2 g-md-3">
+          <div class="row skills-body-row g-2 g-md-3">
             <div class="col-12 col-md-4 min-h-0 d-flex flex-column">
               <div v-if="loadingSkills" class="small text-muted">Loading...</div>
               <div
@@ -1045,15 +1164,12 @@ onUnmounted(() => {
             </div>
             <div class="col-12 col-md-8 min-h-0 d-flex flex-column">
               <div v-if="loadingSkillDetail" class="small text-muted">Loading...</div>
-              <div v-else-if="skillDetail" class="d-flex flex-column flex-grow-1 min-h-0 overflow-hidden">
+              <div v-else-if="skillDetail" class="skill-detail-panel">
                 <div class="fw-semibold mb-1 flex-shrink-0">{{ skillDetail.name }}</div>
                 <div v-if="skillDetail.description" class="small text-muted mb-2 flex-shrink-0">
                   {{ skillDetail.description }}
                 </div>
-                <div
-                  class="session-md flex-grow-1 min-h-0 overflow-auto border rounded-2 bg-body-secondary p-2"
-                  v-html="renderMd(skillDetail.body)"
-                />
+                <div class="skill-detail-md session-md border rounded-2 bg-body-secondary p-2" v-html="renderMd(skillDetail.body)" />
               </div>
               <p v-else class="text-muted small mb-0">Select a skill from the list.</p>
             </div>
@@ -1087,20 +1203,104 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.layout-fill {
+  flex: 1 1 0%;
+  min-width: 0;
+  min-height: 0;
+}
+.preview-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+  flex-shrink: 0;
+}
+.preview-toolbar-end {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
 .workspace-body-grid {
+  flex: 1 1 0%;
+  min-width: 0;
+  min-height: 0;
   align-content: stretch;
   box-sizing: border-box;
 }
-.workspace-chat,
-.workspace-preview {
+.workspace-body-grid > * {
   min-width: 0;
+  min-height: 0;
 }
-.chat-messages-scroll {
+.session-analysis-page {
+  flex: 1 1 0%;
   min-width: 0;
-  max-width: 100%;
-  max-height: min(65vh, calc(100vh - 220px));
+  min-height: 0;
+}
+.skills-panel {
+  flex: 1 1 0%;
+  min-width: 0;
+  min-height: 0;
+}
+.skills-body-row {
+  flex: 1 1 0%;
+  min-height: 0;
+}
+.session-analysis-body {
+  flex: 1 1 0%;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  align-content: stretch;
+}
+.skill-detail-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow: hidden;
+}
+.skill-detail-md {
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow: auto;
+}
+.preview-viewport {
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow: auto;
+}
+.session-analysis-scroll {
+  min-width: 0;
+  min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.workspace-chat,
+.workspace-preview {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.chat-messages-scroll {
+  flex: 1 1 0%;
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+.session-md :deep(.mermaid) {
+  margin: 0.75rem 0;
+  overflow-x: auto;
+  text-align: center;
 }
 .session-md :deep(img) {
   max-width: 100%;

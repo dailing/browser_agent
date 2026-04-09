@@ -16,7 +16,9 @@ from browser_agent.browser_manager import BrowserManager
 from browser_agent.database import create_schema, default_db_path, make_engine, make_session_factory
 from browser_agent.preview_publisher import PreviewPublisher
 from browser_agent.run_coordinator import RunCoordinator
+from browser_agent.llm_client import LlmClient
 from browser_agent.session_fanout import SessionFanout
+from browser_agent.session_analysis import build_session_analysis_user_content
 from browser_agent.session_store import DbSessionStore
 from browser_agent.skills_store import list_skills as scan_skills, load_skill
 from browser_agent.viewport_presets import (
@@ -25,7 +27,7 @@ from browser_agent.viewport_presets import (
 )
 
 START_URL = os.environ.get("BROWSER_AGENT_START_URL", "https://example.com")
-HOST = os.environ.get("BROWSER_AGENT_HOST", "127.0.0.1")
+HOST = os.environ.get("BROWSER_AGENT_HOST", "0.0.0.0")
 PORT = int(os.environ.get("BROWSER_AGENT_PORT", "18000"))
 PREVIEW_MS = int(os.environ.get("BROWSER_AGENT_PREVIEW_MS", "500"))
 
@@ -331,6 +333,49 @@ async def get_session(session_id: str):
         "messages": s.messages,
         "has_live_tab": has_tab,
     }
+
+
+@app.post("/api/sessions/{session_id}/session-analysis")
+async def post_session_analysis(session_id: str):
+    if _session_store is None or _audit is None:
+        raise HTTPException(status_code=503, detail="server not ready")
+    s = await _session_store.get(session_id, with_message_row_ids=True)
+    if s is None:
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        llm = LlmClient(_REPO_ROOT)
+    except (RuntimeError, ValueError) as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    row_ids = s.message_row_ids
+    if row_ids is None or len(row_ids) != len(s.messages):
+        raise HTTPException(status_code=500, detail="internal_error: message_row_ids")
+    message_rows = list(zip(row_ids, s.messages))
+    user_content = build_session_analysis_user_content(
+        message_rows,
+        session_meta={
+            "id": s.id,
+            "name": s.name,
+            "status": s.status,
+            "max_steps": s.max_steps,
+            "error": s.error,
+            "created_at": s.created_at,
+            "updated_at": s.updated_at,
+            "message_count": len(s.messages),
+        },
+    )
+    messages = [{"role": "user", "content": user_content}]
+    choice = await llm.chat_no_tools(
+        messages,
+        session_id=session_id,
+        audit=_audit,
+        purpose="session_analysis",
+    )
+    if choice is None:
+        raise HTTPException(status_code=502, detail="llm_request_failed")
+    text = (choice.message.content or "").strip()
+    if not text:
+        raise HTTPException(status_code=502, detail="empty_llm_response")
+    return {"markdown": text}
 
 
 @app.websocket("/ws/session/{session_id}")

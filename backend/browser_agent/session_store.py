@@ -19,6 +19,7 @@ class SessionView:
     created_at: str
     updated_at: str
     messages: list[dict[str, Any]]
+    message_row_ids: list[int] | None = None
 
 
 class DbSessionStore:
@@ -50,7 +51,7 @@ class DbSessionStore:
         assert out is not None
         return out
 
-    async def get(self, session_id: str) -> SessionView | None:
+    async def get(self, session_id: str, *, with_message_row_ids: bool = False) -> SessionView | None:
         async with self._sf() as db:
             srow = await db.get(SessionRow, session_id)
             if srow is None:
@@ -63,6 +64,7 @@ class DbSessionStore:
             mres = await db.execute(mstmt)
             mrows = mres.scalars().all()
             messages = [dict(m.payload) for m in mrows]
+            row_ids = [m.id for m in mrows] if with_message_row_ids else None
             return SessionView(
                 id=srow.id,
                 name=srow.name,
@@ -72,6 +74,7 @@ class DbSessionStore:
                 created_at=self._iso(srow.created_at),
                 updated_at=self._iso(srow.updated_at),
                 messages=messages,
+                message_row_ids=row_ids,
             )
 
     async def list_summaries(self) -> list[dict[str, Any]]:

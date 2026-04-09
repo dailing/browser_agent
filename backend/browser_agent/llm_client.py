@@ -119,3 +119,85 @@ class LlmClient:
             }
         )
         return ch
+
+    async def chat_no_tools(
+        self,
+        messages: list[ChatCompletionMessageParam],
+        *,
+        session_id: str,
+        audit: JsonlAudit,
+        purpose: str = "text",
+    ):
+        """Single completion without tool calling (e.g. session analysis)."""
+        audit.emit(
+            {
+                "type": "llm_request",
+                "session_id": session_id,
+                "turn": 0,
+                "model": self._model,
+                "messages": list(messages),
+                "purpose": purpose,
+            }
+        )
+        for attempt in range(len(_OVERLOAD_RETRY_DELAYS_SEC) + 1):
+            try:
+                resp = await self._client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                    temperature=self._temperature,
+                )
+                break
+            except Exception as e:
+                will_retry = attempt < len(_OVERLOAD_RETRY_DELAYS_SEC)
+                audit.emit(
+                    {
+                        "type": "llm_error",
+                        "session_id": session_id,
+                        "turn": 0,
+                        "attempt": attempt + 1,
+                        "will_retry": will_retry,
+                        "purpose": purpose,
+                        "error": str(e),
+                    },
+                )
+                if attempt < len(_OVERLOAD_RETRY_DELAYS_SEC):
+                    delay_sec = _OVERLOAD_RETRY_DELAYS_SEC[attempt]
+                    logger.warning(
+                        "LLM request failed; retrying in {}s (attempt {}/{})",
+                        delay_sec,
+                        attempt + 1,
+                        len(_OVERLOAD_RETRY_DELAYS_SEC),
+                    )
+                    audit.emit(
+                        {
+                            "type": "llm_retry",
+                            "session_id": session_id,
+                            "turn": 0,
+                            "attempt": attempt + 1,
+                            "delay_sec": delay_sec,
+                            "purpose": purpose,
+                            "reason": "llm_request_error",
+                            "error": str(e),
+                        },
+                    )
+                    await asyncio.sleep(delay_sec)
+                    continue
+                logger.error("LLM request failed after retries: {}", e)
+                return None
+
+        ch = resp.choices[0]
+        msg = ch.message
+        usage = resp.usage.model_dump() if resp.usage else None
+        audit.emit(
+            {
+                "type": "llm_response",
+                "session_id": session_id,
+                "turn": 0,
+                "finish_reason": ch.finish_reason,
+                "content": msg.content,
+                "tool_calls": None,
+                "usage": usage,
+                "purpose": purpose,
+            },
+        )
+        return ch
